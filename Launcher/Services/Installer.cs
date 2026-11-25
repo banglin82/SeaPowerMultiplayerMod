@@ -178,8 +178,6 @@ namespace SeapowerMultiplayer.Launcher.Services
 
             ExtractEmbeddedResource("SeapowerMultiplayer.dll",
                 Path.Combine(pluginsPath, "SeapowerMultiplayer.dll"));
-            ExtractEmbeddedResource("LiteNetLib.dll",
-                Path.Combine(pluginsPath, "LiteNetLib.dll"));
         }
 
         private static void ExtractEmbeddedResource(string resourceName, string destPath)

@@ -1,0 +1,50 @@
+name: Release
+
+# Attaches SeapowerMultiplayerLauncher.exe to a GitHub release.
+#
+# The mod DLL cannot be built on a hosted runner (see ci.yml), so it is built
+# locally and uploaded to the release as SeapowerMultiplayer.dll BEFORE the
+# release is published. This workflow then downloads that DLL, embeds it in the
+# Launcher, and uploads the Launcher to the same release.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build the Launcher for (e.g. v1.0.0)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  launcher:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Download mod DLL from the release
+        shell: bash
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern SeapowerMultiplayer.dll --dir release-dll
+      - name: Publish Launcher with the DLL embedded
+        shell: bash
+        run: |
+          dotnet publish Launcher/SeapowerMultiplayer.Launcher.csproj -c Release \
+            -p:ModDllPath="$GITHUB_WORKSPACE/release-dll/SeapowerMultiplayer.dll" \
+            -p:RequireModDll=true -o launcher-out
+      - name: Upload Launcher to the release
+        shell: bash
+        run: |
+          gh release upload "$TAG" launcher-out/SeapowerMultiplayerLauncher.exe \
+            --repo "$GITHUB_REPOSITORY" --clobber

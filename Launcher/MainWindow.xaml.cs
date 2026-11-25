@@ -397,19 +397,16 @@ namespace SeapowerMultiplayer.Launcher
             }
         }
 
-        private const string CurrentVersion = "1.0.4";
+        private const string CurrentVersion = "1.0.0";
 
         /// <summary>Shown in the WHAT'S NEW panel. Replace wholesale each release.</summary>
         private static readonly string[] WhatsNew =
         {
-            "Client aircraft no longer spam chaff",
-            "Weapon ammo counts are accurate on all client systems",
-            "AI sensor state is synced to client in CoOp",
-            "Contacts synced between client and host correctly in CoOp sharing contact numbers, status, and identification",
-            "Client replicates aircraft evasive maneuvers",
-            "Fixed an O(n*m) lookup causing missions to stutter after ~1 hour for both sides",
-            "Client jittering solved for ships, subs, and missiles",
-            "Improved networking robustness",
+            "Up to 8 players: co-op, versus, or any mix of teams",
+            "Teammates on any side share one contact picture - track numbers, identification and contacts",
+            "Fixed contacts flickering when two or more guests share a side",
+            "Direct-IP joins honour the DefaultTeam setting",
+            "Launcher updates now come from the banglin82 fork",
         };
 
         private async void BtnLaunch_Click(object sender, RoutedEventArgs e)

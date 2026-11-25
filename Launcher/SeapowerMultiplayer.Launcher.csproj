@@ -15,15 +15,21 @@
     <ApplicationIcon>SPM.ico</ApplicationIcon>
   </PropertyGroup>
 
-  <!-- Embed mod DLLs from the plugin build output -->
+  <PropertyGroup>
+    <ModDllPath Condition="'$(ModDllPath)' == ''">..\src\bin\Release\net472\merged\SeapowerMultiplayer.dll</ModDllPath>
+  </PropertyGroup>
+
+  <!-- Embed the merged plugin DLL; override its path with ModDllPath. -->
   <ItemGroup>
-    <EmbeddedResource Include="..\src\bin\Debug\net472\SeapowerMultiplayer.dll"
+    <EmbeddedResource Include="$(ModDllPath)"
                       LogicalName="SeapowerMultiplayer.dll"
-                      Condition="Exists('..\src\bin\Debug\net472\SeapowerMultiplayer.dll')" />
-    <EmbeddedResource Include="..\src\bin\Debug\net472\LiteNetLib.dll"
-                      LogicalName="LiteNetLib.dll"
-                      Condition="Exists('..\src\bin\Debug\net472\LiteNetLib.dll')" />
+                      Condition="Exists('$(ModDllPath)')" />
   </ItemGroup>
+
+  <Target Name="RequireModDll" BeforeTargets="BeforeBuild"
+          Condition="'$(RequireModDll)' == 'true' And !Exists('$(ModDllPath)')">
+    <Error Text="Mod DLL not found at $(ModDllPath). Build the merged plugin or set ModDllPath to its location." />
+  </Target>
 
   <!-- BepInEx zip — user places this in Resources/ manually -->
   <ItemGroup>
