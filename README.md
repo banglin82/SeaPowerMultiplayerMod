@@ -15,11 +15,11 @@
 
 <br>
 
-Play any Sea Power scenario head-to-head with a friend. One player hosts, the other connects, and you're in. Both instances run their own units authoritatively, with game state synced over UDP or Steam P2P.
+Play any Sea Power scenario with up to 8 players, in any mix of co-op and versus - 2v2, 2v1, or everyone on one side. One player hosts, and the host's game runs the authoritative simulation for every unit. Other players' orders go to the host, with game state synced over UDP or Steam P2P.
 
 ### How combat works
 
-Combat is resolved by the **target** of the engagement. If Player A fires a missile at Player B, then Player B's game decides the outcome. If B's air defence intercepts it, that result syncs to A. If the missile hits, both sides see the hit. When the two instances disagree, the target's outcome is always final.
+The host's game decides every engagement outcome - hits, intercepts, damage and destruction - and streams the result to all players. Guests' local simulations are not allowed to destroy or spawn things on their own.
 
 > This is a community mod and is not affiliated with Triassic Games.
 
@@ -44,12 +44,11 @@ Steam workshop recieves the most up to date fixes and is the simplest installati
 <details>
 <summary><b>Option 2: Use the Launcher</b></summary>
 
-The launcher handles everything automatically - it installs BepInEx, copies the plugin, and launches the game.
+1. Subscribe to **Anchor Chain** on the Steam Workshop and follow its [installation guide](https://seapower-modders.github.io/AnchorChain/) to install the BepInEx preloader.
+2. Subscribe to **Seapower Multiplayer** on the Steam Workshop.
+3. Launch the game, open the mod menu and **tick Seapower Multiplayer**, then **fully close and reopen the game**.
 
-1. Download **SeapowerMultiplayer.Launcher.exe** from the [Releases](../../releases) page.
-2. Run the launcher.
-3. It will auto-detect your Sea Power installation, install BepInEx if needed, and copy the plugin DLL into the correct folder.
-4. Click **Launch** to start the game with the mod loaded.
+> Applying a mod change only reloads the scene (`SceneManager.LoadScene(0)`), it does not restart the process. Anchor Chain loads plugins once per process, so enabling or disabling any code mod needs a full restart to take effect.
 
 </details>
 
@@ -58,11 +57,9 @@ The launcher handles everything automatically - it installs BepInEx, copies the 
 
 If you prefer to manage things yourself:
 
-1. Download and install **[BepInEx 5.4.x](https://github.com/BepInEx/BepInEx/releases)** into your Sea Power game directory.
-   - Extract the BepInEx zip so that `BepInEx/` sits alongside `Sea Power.exe`.
-   - Run the game once to let BepInEx generate its folder structure, then close it.
-2. Download **SeapowerMultiplayer.dll** from the [Releases](../../releases) page.
-3. Copy the DLL into `Sea Power/BepInEx/plugins/`.
+1. Install **Anchor Chain** and its preloader as above (this also installs BepInEx).
+2. Download **SeapowerMultiplayer.dll** and **_info.ini** from the [Releases](../../releases) page.
+3. Create a folder `Sea Power/Sea Power_Data/StreamingAssets/SeapowerMultiplayer/` and put both files inside it.
 4. Launch the game normally.
 
 </details>
@@ -74,7 +71,7 @@ If you prefer to manage things yourself:
    ```bash
    git clone https://github.com/malfboi/SeaPowerMultiplayerMod.git
    ```
-2. Make sure **BepInEx 5.4.x** is installed in your game directory (see Option 2 above).
+2. Make sure **Anchor Chain** (and therefore BepInEx 5.4.x) is installed in your game directory (see Option 2 above).
 3. Build the plugin:
    ```bash
    dotnet build src/SeapowerMultiplayer.csproj
@@ -83,7 +80,7 @@ If you prefer to manage things yourself:
    ```bash
    dotnet build src/SeapowerMultiplayer.csproj /p:GameDir="D:\Games\Steam\steamapps\common\Sea Power"
    ```
-   The build automatically copies the DLL and its dependencies into `BepInEx/plugins/`.
+   The build merges LiteNetLib into the DLL and copies it, with `_info.ini`, into `Sea Power_Data/StreamingAssets/SeapowerMultiplayer/`. Nothing else needs copying.
 
 </details>
 
@@ -97,8 +94,8 @@ If you prefer to manage things yourself:
 2. Open a mission.
 3. Press **Ctrl+F9** to open the multiplayer overlay.
 4. Click **Host Lobby**.
-5. Click **Invite Friend** and send a Steam invite.
-6. Your friend accepts and is automatically connected and synced into the mission.
+5. Click **Invite player to \<side\>** for the side your friend should join and send a Steam invite. There is one button per side in the mission.
+6. Your friend accepts and is automatically connected and synced into the mission. Repeat to invite more players.
 
 ### Via Direct Connect
 
@@ -106,46 +103,62 @@ If you prefer to manage things yourself:
 2. Press **Ctrl+F9** to open the multiplayer overlay (top-right corner).
 3. **Host:** Open a mission, then click **Start Hosting**. Default port is `7777`.
 4. **Client:** Enter the host's IP address, then click **Connect**.
-5. Once connected, the host clicks **Send Scene to Client** to sync the scenario.
+5. Each client asks for the side in its `DefaultTeam` config setting. Before a player has loaded, the host can move them using the side buttons on their roster row.
+6. Once connected, the host clicks **Send** on each player's roster row to sync the scenario to them.
 
-The client automatically receives and loads the host's save - no need to manually load the same mission.
+Each client automatically receives and loads the host's save - no need to manually load the same mission.
+
+### Teams and units
+
+The host is always on the mission's player side. Teammates share their contact picture and map drawings; opponents don't. With **Lock units to players** on, each player owns the formations assigned to them, and formations can be handed to a teammate with **Send formation to player** in the right-click menu.
+
+The **Name** (`Username`) setting is what other players see in the roster.
 
 ### In-Game Controls
 
-Both players use the normal game controls. In PvP, both sides are authoritative for their own units. In co-op, the host's game is authoritative and client orders are sent to the host for execution.
+All players use the normal game controls. The host's game is authoritative for every unit, and guest orders are sent to the host for execution.
 
 | Action | Shortcut | Notes |
 |--------|----------|-------|
 | Open multiplayer overlay | `Ctrl+F9` | Host, connect, invite, send scene |
-| Force resync | `Ctrl+F10` | Either player can trigger this |
+| Force resync | `Ctrl+F10` | Any player can trigger this |
 | Time controls | Normal keys | Synced - host decides and broadcasts the result |
 
 <br>
 
 ## Configuration
 
-The mod generates a config file at `BepInEx/config/SeapowerMultiplayer.cfg` on first launch.
+Press **Ctrl+F9** in-game and open the **Settings** section of the overlay. Changes are saved immediately - no restart needed.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `IsHost` | `true` | Run as host (server) or client |
-| `HostIP` | `127.0.0.1` | IP to connect to (client only) |
+| `Role` | `HOST` | Run as host (server) or client |
+| `Transport` | `Direct IP` | Network transport - `Direct IP` (LiteNetLib) or `Steam` |
+| `Host IP` | `127.0.0.1` | IP to connect to (client only) |
 | `Port` | `7777` | UDP port (must match on both sides) |
-| `AutoConnect` | `false` | Automatically host/connect on game launch |
-| `TransportType` | `LiteNetLib` | Network transport - `LiteNetLib` or `Steam` |
+| `Name` | empty | Name shown to other players |
+| `Lock units to players` | on | Host setting: assign formations to individual players |
+| `Auto-connect` | off | Automatically host/connect on game launch |
+| `Time vote` | off | Players must agree on time compression changes |
+
+Two more settings live only in the config file, under `[Network]`: `DefaultTeam` (Blue) is the side a client asks for when it connects by IP, and `PvP` (off) makes a Steam lobby seat players who join without a side-specific invite on the side opposite the host.
+
+Network settings are locked while a session is running - disconnect to change them. The **Advanced** subsection holds state-stream rates and debug options, which apply live.
+
+Settings are still persisted to `BepInEx/config/com.seapowermultiplayer.plugin.cfg`, so the file can be edited directly if you prefer.
 
 ### Network Requirements
 
 | Transport | Port Forwarding | Details |
 |-----------|:-:|---------|
-| **LiteNetLib (UDP)** | Required | Host must open port `7777` (or configured port) for UDP. Both players need a direct network path (LAN, port forwarding, or VPN). |
+| **LiteNetLib (UDP)** | Required | Host must open port `7777` (or configured port) for UDP. Each player needs a direct network path to the host (LAN, port forwarding, or VPN). |
 | **Steam P2P** | Not required | Uses Steam's relay network. Just works. |
 
 <br>
 
 **Key concepts:**
 
-- **Authority model** - Each player is authoritative over their own units. Combat outcomes are decided by the target's game instance.
+- **Authority model** - The host simulates every unit and decides combat outcomes; guests send orders to the host.
 - **Transport abstraction** - Networking is abstracted behind `ITransport`, making it easy to swap between LiteNetLib (UDP) and Steam P2P.
 - **Harmony patching** - The mod hooks into the game via [Harmony](https://github.com/pardeike/Harmony) patches, intercepting and extending game methods at runtime.
 - **State reconciliation** - Host broadcasts authoritative unit state; clients apply snap/lerp corrections in `StateApplier` to keep puppet units aligned.
@@ -159,18 +172,18 @@ Contributions are welcome! Whether it's a bug fix, new feature, or documentation
 ### Getting set up
 
 1. **Fork & clone** the repository.
-2. **Install [BepInEx 5.4.x](https://github.com/BepInEx/BepInEx/releases)** into your Sea Power game directory.
+2. **Install [Anchor Chain](https://seapower-modders.github.io/AnchorChain/)** (and its BepInEx preloader) into your Sea Power game directory.
 3. **Build:**
    ```bash
    dotnet build src/SeapowerMultiplayer.csproj /p:GameDir="<your Sea Power install path>"
    ```
-4. The DLL is automatically copied to `BepInEx/plugins/` on successful build.
+4. The DLL is automatically copied to `Sea Power_Data/StreamingAssets/SeapowerMultiplayer/` on successful build.
 
 ### Guidelines
 
 - **Keep PRs small and focused.** One feature or one fix per PR. Large, sweeping changesets are hard to review and slow down the merge process. If your work touches multiple areas, split it into separate PRs.
 - **Follow existing code style** and naming conventions.
-- **Test in a live multiplayer session** before submitting. At minimum, verify your change works in a two-player session (host + client). Pay special attention to combat sync - missiles, air defence, carrier ops, and ground attacks are all areas where subtle issues can hide.
+- **Test in a live multiplayer session** before submitting. At minimum, verify your change works in a two-player session (host + client), and also test with 3+ players when touching networking or teams. Pay special attention to combat sync - missiles, air defence, carrier ops, and ground attacks are all areas where subtle issues can hide.
 - **Open an issue first for large features** so we can discuss the approach before you invest time building it.
 - **Document what you changed** in your PR description. Explain *what* and *why*, not just *how*.
 
@@ -235,7 +248,7 @@ Verify the host's IP and port are correct, and that the UDP port is open in the 
 <details>
 <summary><b>Desync or drift</b></summary>
 
-The mod includes automatic drift detection and correction. If issues persist, either player can press **Ctrl+F10** to force a resync, or the host can re-send the scene via the Ctrl+F9 overlay.
+The mod includes automatic drift detection and correction. If issues persist, any player can press **Ctrl+F10** to force a resync, or the host can re-send the scene via the Ctrl+F9 overlay.
 
 </details>
 
@@ -260,7 +273,7 @@ The mod includes automatic drift detection and correction. If issues persist, ei
 - [x] Core PvP multiplayer
 - [ ] PvP beta bug fixes
 - [x] Co-op mode
-- [ ] Support for more than 2 players
+- [x] Support for more than 2 players
 - [ ] Headless persistent server
 
 Have ideas? [Open a discussion](../../discussions) or share them in the [Discord](https://discord.gg/rMMnwJHc8w).

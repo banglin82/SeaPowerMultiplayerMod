@@ -9,9 +9,8 @@ namespace SeapowerMultiplayer
     /// Both run at human timescales - contacts change over seconds and markers are
     /// placed by hand - so neither shares the 10 Hz entity stream's timer.
     ///
-    /// BOTH ARE CO-OP ONLY. They exist to give two players commanding one task force
-    /// the same picture; in PvP the players are opponents whose pictures are supposed
-    /// to differ, and sharing either one would give the game away.
+    /// Both are team-scoped. Players commanding one task force share its picture;
+    /// opponents' pictures are supposed to differ.
     /// </summary>
     public class ContactSyncStreamer : MonoBehaviour
     {
@@ -26,7 +25,7 @@ namespace SeapowerMultiplayer
         }
 
         private static bool SessionLive()
-            => ContactSyncManager.CoopSessionActive
+            => (Plugin.Instance.CfgIsHost.Value ? ContactSyncManager.HostAnyTeamShares : ContactSyncManager.TeamSessionActive)
                && SimSyncManager.CurrentState == SimState.Synchronized
                && !SessionManager.SceneLoading;
 

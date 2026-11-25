@@ -37,26 +37,33 @@ namespace SeapowerMultiplayer
 
         // ── Host capture ──────────────────────────────────────────────────────
 
-        private static readonly Dictionary<int, (string text, byte[] mounts, float range)> _lastSent = new(256);
+        // PER TEAM. One delta table with two audiences is silently wrong: whatever it
+        // already sent to the first team it then withholds from the second, so the
+        // second team's status lines simply stop updating with nothing to indicate why.
+        // Filled per side on first use - a mission can have any number of them.
+        private static readonly Dictionary<Team, Dictionary<int, (string text, byte[] mounts, float range, int homeBase)>> _lastSentByTeam =
+            new();
+
         private static readonly UnitStatusMessage _msg = new();
         private static readonly HashSet<int> _seen = new(256);
         private static readonly List<UnitStatusMessage.Mount> _scratch = new(64);
         private static readonly List<byte> _packed = new(128);
         private static float _nextFullSweep;
 
-        /// <summary>PvP: only the remote player's own taskforce. A status line that
-        /// names the track a ship is engaging is intelligence, and so is seeing an
-        /// opponent's mounts go to Engaging. Co-op: the whole friendly side, which
-        /// both players command and already share a contact picture for.</summary>
-        private static bool IsClientVisible(ObjectBase unit, bool pvp)
-        {
-            var tf = unit._taskforce;
-            if (tf == null) return false;
-            if (pvp) return tf == Globals._enemyTaskforce;
-            return tf.Side == Taskforce.TfType.Player || tf.Side == Taskforce.TfType.Ally;
-        }
+        /// <summary>
+        /// May a player on <paramref name="team"/> see this unit's status?
+        ///
+        /// The rule is simply "your own side" - a status line naming the track a ship is
+        /// engaging is intelligence, and so is watching an opponent's mounts go to
+        /// Engaging. The old mode-keyed version said the same thing twice in two
+        /// different ways (co-op: the friendly side; PvP: the enemy taskforce, which was
+        /// that player's own side after the swap); stating it once per team covers every
+        /// seating, including two players sharing one side.
+        /// </summary>
+        private static bool IsVisibleTo(ObjectBase unit, Team team)
+            => Teams.TeamOf(unit._taskforce) == team;
 
-        /// <summary>Host: sweep the units the client can inspect and send what changed.</summary>
+        /// <summary>Host: sweep each team's own units and send that team what changed.</summary>
         public static void HostBroadcast()
         {
             if (!Plugin.Instance.CfgIsHost.Value) return;
@@ -65,11 +72,24 @@ namespace SeapowerMultiplayer
             bool full = Time.unscaledTime >= _nextFullSweep;
             if (full) _nextFullSweep = Time.unscaledTime + FullSweepInterval;
 
+            // Slot 0 is the host and needs nothing sent to it, so only teams with a
+            // GUEST on them are worth sweeping.
+            foreach (var team in SideTable.All)
+                SweepTeam(team, full);
+        }
+
+        private static void SweepTeam(Team team, bool full)
+        {
+            if (PlayerRegistry.CountOnTeam(team) == 0) return;
+            if (team == Team.Host && PlayerRegistry.TeammateCount(0) == 0) return; // host alone on its side
+
+            if (!_lastSentByTeam.TryGetValue(team, out var lastSent))
+                _lastSentByTeam[team] = lastSent = new Dictionary<int, (string, byte[], float, int)>(256);
+
             _msg.Reset();
             _msg.IsFull = full;
             _seen.Clear();
 
-            bool pvp = Plugin.Instance.CfgPvP.Value;
             var all = UnitRegistry.All;
             for (int i = 0; i < all.Count; i++)
             {
@@ -77,34 +97,37 @@ namespace SeapowerMultiplayer
                 if (unit == null || unit.UniqueID == 0) continue;
                 if (unit is WeaponBase) continue;
                 if (unit.IsDestroyed) continue;
-                if (!IsClientVisible(unit, pvp)) continue;
+                if (!IsVisibleTo(unit, team)) continue;
 
                 string text = unit.CurrentOrderText?.Value ?? "";
                 BuildMounts(unit);
                 float range = FuelRangeOf(unit);
+                int homeBaseId = HomeBaseOf(unit);
 
                 int id = unit.UniqueID;
                 _seen.Add(id);
 
-                bool known = _lastSent.TryGetValue(id, out var previous);
+                bool known = lastSent.TryGetValue(id, out var previous);
                 if (!full && known && previous.text == text && SamePacked(previous.mounts)
-                    && Mathf.Abs(previous.range - range) < FuelDeltaKm)
+                    && Mathf.Abs(previous.range - range) < FuelDeltaKm
+                    && previous.homeBase == homeBaseId)
                     continue;
 
-                _lastSent[id] = (text, _packed.ToArray(), range);
+                lastSent[id] = (text, _packed.ToArray(), range, homeBaseId);
                 _msg.Entries.Add(new UnitStatusMessage.Entry
                 {
-                    UniqueId  = id,
-                    OrderText = text,
-                    RangeKm   = range,
-                    Mounts    = new List<UnitStatusMessage.Mount>(_scratch),
+                    UniqueId   = id,
+                    OrderText  = text,
+                    RangeKm    = range,
+                    HomeBaseId = homeBaseId,
+                    Mounts     = new List<UnitStatusMessage.Mount>(_scratch),
                 });
 
-                if (_msg.Entries.Count >= MaxEntriesPerPacket) Flush();
+                if (_msg.Entries.Count >= MaxEntriesPerPacket) Flush(team);
             }
 
-            if (full) PruneLastSent();
-            if (_msg.Entries.Count > 0) Flush();
+            if (full) PruneLastSent(lastSent);
+            if (_msg.Entries.Count > 0) Flush(team);
         }
 
         /// <summary>How far RangeInKm has to move before it is worth a packet.
@@ -127,13 +150,23 @@ namespace SeapowerMultiplayer
             return unit.RangeInKm?.Value ?? 0f;
         }
 
+        /// <summary>The unit's home base id, or 0 for "none" / not an air unit. Part of
+        /// the change signature, so a rebase (or a base being sunk) travels the moment it
+        /// happens rather than waiting for the sweep.</summary>
+        private static int HomeBaseOf(ObjectBase unit)
+        {
+            if (!(unit is Aircraft) && !(unit is Helicopter)) return 0;
+            var home = unit._homeBase;
+            return home != null ? home.UniqueID : 0;
+        }
+
         /// <summary>Client: re-anchor an air unit's tank to the host's, then let the
         /// game recompute everything that hangs off it.
         ///
         /// UpdateFuelConsumption is the game's own re-derivation - Aircraft's load path
         /// calls exactly this pair, RangeInKm followed by UpdateFuelConsumption(0f)
-        /// (Aircraft.cs:1801-1802) - so ActualRangeInKm, RangeOnMap, EnduranceInSec and
-        /// the endurance ring all fall out of it rather than being set by hand here.
+        /// (Aircraft.LoadStateFromFile) - so ActualRangeInKm, RangeOnMap, EnduranceInSec
+        /// and the endurance ring all fall out of it rather than being set by hand here.
         /// The two overloads differ only in signature.</summary>
         private static void ApplyFuel(ObjectBase unit, float rangeKm)
         {
@@ -145,6 +178,41 @@ namespace SeapowerMultiplayer
 
             if (unit is Aircraft a)        a.UpdateFuelConsumption(0f);
             else if (unit is Helicopter h) h.UpdateFuelConsumption();
+        }
+
+        /// <summary>Impose the host's home base on an air replica. This is what makes a
+        /// guest's return-to-base order work at all - see UnitStatusMessage.Entry
+        /// .HomeBaseId for why the client can never resolve it itself.
+        ///
+        /// Rebase() rather than a raw field write: it also moves the unit between the two
+        /// bases' _childAircraft lists, which is what FlightDeck recovery and the base's
+        /// own aircraft count read. It dereferences its argument, so clearing to null is
+        /// done by hand.</summary>
+        private static void ApplyHomeBase(ObjectBase unit, int homeBaseId)
+        {
+            if (!(unit is Aircraft) && !(unit is Helicopter)) return;
+
+            var current = unit._homeBase;
+            if (homeBaseId == 0)
+            {
+                // The host says "no base". Only act on a real change, and only by
+                // clearing - Rebase(null) would throw.
+                if (current == null) return;
+                if (current._childAircraft.Contains(unit)) current._childAircraft.Remove(unit);
+                unit._homeBase = null;
+                return;
+            }
+
+            if (current != null && current.UniqueID == homeBaseId) return;
+
+            var home = StateSerializer.FindById(homeBaseId);
+            // Not an error: the base's own replica may not be built yet. The next sweep
+            // carries the same value, so this heals on its own.
+            if (home == null || home == unit) return;
+
+            unit.Rebase(home);
+            Telemetry.Count("v2.homeBaseApplied");
+            Plugin.Log.LogInfo($"[Order] Home base for {unit.getUIDAndName()} -> {home.getUIDAndName()}");
         }
 
         /// <summary>Fills _scratch (wire form) and _packed (change-detection form)
@@ -210,18 +278,18 @@ namespace SeapowerMultiplayer
 
         /// <summary>Forget units that are gone, so a re-used id is not mistaken for
         /// unchanged and skipped.</summary>
-        private static void PruneLastSent()
+        private static void PruneLastSent(Dictionary<int, (string text, byte[] mounts, float range, int homeBase)> lastSent)
         {
-            if (_lastSent.Count == _seen.Count) return;
+            if (lastSent.Count == _seen.Count) return;
             var stale = new List<int>();
-            foreach (var id in _lastSent.Keys)
+            foreach (var id in lastSent.Keys)
                 if (!_seen.Contains(id)) stale.Add(id);
-            for (int i = 0; i < stale.Count; i++) _lastSent.Remove(stale[i]);
+            for (int i = 0; i < stale.Count; i++) lastSent.Remove(stale[i]);
         }
 
-        private static void Flush()
+        private static void Flush(Team team)
         {
-            NetworkManager.Instance.BroadcastToClients(_msg, DeliveryMethod.ReliableOrdered);
+            NetworkManager.Instance.SendToTeam(team, _msg, DeliveryMethod.ReliableOrdered);
             Telemetry.Count("v2.unitStatusSent");
             _msg.Reset(); // clears IsFull - continuation packets must not re-assert it
         }
@@ -325,6 +393,55 @@ namespace SeapowerMultiplayer
             }
         }
 
+        /// <summary>Aim-failure backoff per mount, keyed (unit id, mount index).
+        ///
+        /// A mount that throws tends to throw every frame after it, and the loop below
+        /// runs from LateUpdate - so an unthrottled failure costs a thrown exception and
+        /// a BepInEx disk write per mount per frame, on the render path. One PvP client
+        /// log carried 4,378 of them, 2,709 from a single pair of F-14s and the rest from
+        /// two Perrys: over half the lines in the file.
+        ///
+        /// THROTTLED, NOT RETIRED. This used to be a permanent per-session blacklist, on
+        /// the reasoning that the cause never heals - index i naming a different
+        /// WeaponSystem than it does on the host, say. But not every cause is permanent:
+        /// a target can be mid-teardown, a mount can be re-seated by a damage or reload
+        /// transition, and a replica's systems list is not fully populated the instant it
+        /// spawns. A blacklist turns any of those into a mount that never aims again for
+        /// the rest of the battle, which is a silent and permanent loss of fidelity for
+        /// a transient fault.
+        ///
+        /// So a throw puts the mount on a cooldown that doubles each time, capped - a
+        /// genuinely broken mount settles at one attempt a minute (negligible), while a
+        /// transient one is retried almost immediately and clears itself on success.</summary>
+        private readonly struct AimBackoff
+        {
+            public readonly float RetryAt;
+            public readonly int   Strikes;
+            public readonly float LastLoggedAt;
+
+            public AimBackoff(float retryAt, int strikes, float lastLoggedAt)
+            {
+                RetryAt = retryAt; Strikes = strikes; LastLoggedAt = lastLoggedAt;
+            }
+        }
+
+        private static readonly Dictionary<(int unitId, int mount), AimBackoff> _aimBackoff = new();
+
+        /// <summary>First retry delay after a throw. Short, so a transient fault costs
+        /// almost nothing in aiming fidelity.</summary>
+        private const float AimRetryBaseSec = 1f;
+
+        /// <summary>Ceiling on the doubling. A permanently broken mount ends up here and
+        /// costs one thrown exception a minute, which is the cost the old blacklist was
+        /// bought to avoid - without giving up on it forever.</summary>
+        private const float AimRetryMaxSec = 60f;
+
+        /// <summary>How often a given mount may put a line in the log, however often it
+        /// throws. The cooldown alone already bounds the throws; this bounds the NOISE
+        /// independently, so the first failure is always visible and a persistent one
+        /// stays visible without ever becoming a flood.</summary>
+        private const float AimLogIntervalSec = 30f;
+
         /// <summary>
         /// CLIENT: train each engaging mount on the target the host says it is engaging.
         ///
@@ -380,6 +497,10 @@ namespace SeapowerMultiplayer
                     var ws = systems[i];
                     if (ws == null || ws.Inoperable.Value) continue;
 
+                    var aimKey = (e.UniqueId, i);
+                    if (_aimBackoff.TryGetValue(aimKey, out var backoff)
+                        && Time.unscaledTime < backoff.RetryAt) continue;
+
                     var target = ReplicaRegistry.Find(m.TargetId) ?? StateSerializer.FindById(m.TargetId);
                     if (target == null || target.IsDestroyed) continue;
 
@@ -389,10 +510,30 @@ namespace SeapowerMultiplayer
                     bool fixedAngle = ws is WeaponSystemLauncher
                                    && ws._vwp != null && ws._vwp._fixVerticalLaunchAngleForLauncher;
 
-                    try { ws.alignToTarget(target.getUnityPosition(), fixedAngle, 0); }
+                    try
+                    {
+                        ws.alignToTarget(target.getUnityPosition(), fixedAngle, 0);
+                        // Recovered - forget the backoff so the next fault starts from a
+                        // short delay again rather than inheriting an old escalation.
+                        _aimBackoff.Remove(aimKey);
+                    }
                     catch (System.Exception ex)
                     {
-                        Plugin.Log.LogWarning($"[UnitStatus] {unit.name} mount {i} alignToTarget threw: {ex.Message}");
+                        float now     = Time.unscaledTime;
+                        int   strikes = backoff.Strikes + 1;
+                        float delay   = Mathf.Min(AimRetryBaseSec * (1 << Mathf.Min(strikes - 1, 6)),
+                                                  AimRetryMaxSec);
+
+                        bool loggable = strikes == 1
+                                     || now - backoff.LastLoggedAt >= AimLogIntervalSec;
+                        if (loggable)
+                        {
+                            Plugin.Log.LogWarning($"[UnitStatus] {unit.name} mount {i} alignToTarget threw: " +
+                                $"{ex.Message} - backing off {delay:0.#}s (attempt {strikes})");
+                        }
+
+                        _aimBackoff[aimKey] = new AimBackoff(
+                            now + delay, strikes, loggable ? now : backoff.LastLoggedAt);
                     }
                 }
             }
@@ -417,6 +558,11 @@ namespace SeapowerMultiplayer
             // number moving, which is what makes it smooth.
             if (fromNetwork) ApplyFuel(unit, e.RangeKm);
 
+            // Unconditional, unlike fuel: nothing on the client writes _homeBase, so
+            // there is no local value to drag backwards, and re-imposing it is how a
+            // dropped packet heals.
+            ApplyHomeBase(unit, e.HomeBaseId);
+
             var systems = unit._obp?._weaponSystems;
             if (systems == null || e.Mounts == null) return;
 
@@ -435,10 +581,11 @@ namespace SeapowerMultiplayer
 
         public static void Reset()
         {
-            _lastSent.Clear();
+            foreach (var t in _lastSentByTeam.Values) t.Clear();
             _seen.Clear();
             _desired.Clear();
             DesiredEngage.Clear();
+            _aimBackoff.Clear();
             _scratch.Clear();
             _packed.Clear();
             _nextFullSweep = 0f;

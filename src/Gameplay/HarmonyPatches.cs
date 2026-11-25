@@ -13,6 +13,11 @@ using VesselStates;
 
 namespace SeapowerMultiplayer
 {
+    // The overlay's settings fields used to need a prefix here to mute the game's
+    // hotkey pump while typing. The Noesis overlay sets InputHandler.typingActive
+    // instead - the game's own flag, which OnUpdate already honours - so the
+    // patch is gone rather than duplicated.
+
     // ── UnitRegistry lifecycle hooks ────────────────────────────────────────
     // Harmony patches ObjectBase.Awake (non-virtual, public) and OnDestroy (private)
     // to maintain the UnitRegistry without per-frame FindObjectsByType calls.
@@ -174,7 +179,15 @@ namespace SeapowerMultiplayer
         }
     }
 
-    // Guard CIWS weapon constructor - effect prefab can be null during save-file load
+    // Guard CIWS weapon constructor - the effect prefab can be null (tracer audio set
+    // up against a bare EnvironmentAudioManager), and the throw kills the mission-load
+    // coroutine that is building the unit.
+    //
+    // This used to also require SessionManager.SceneLoading, which is set only around
+    // OUR load paths - so a host pressing Play Mission through the game's own menu,
+    // outside a session, still lost the load to the same NRE. The gate bought nothing:
+    // this is a constructor finalizer that only ever swallows NREs, and letting one
+    // through has no upside at any point in the mod's lifecycle.
     [HarmonyPatch(typeof(WeaponSystemCIWS),
         MethodType.Constructor,
         new[] { typeof(ObjectBase), typeof(WeaponParameters), typeof(UnityEngine.GameObject), typeof(ObjectBaseParameters) })]
@@ -247,7 +260,8 @@ namespace SeapowerMultiplayer
 
             if (Suppression.HostSuppressesRemoteTfAi(__instance)
                 && _remoteCommanded.TryGetValue(__instance.UniqueID, out int cmd)
-                && telegraph != cmd)
+                && telegraph != cmd
+                && !DoctrineCycle.Drives(__instance)) // the owner's standing order, not host AI
             {
                 __state = false;
                 return false;
@@ -309,7 +323,8 @@ namespace SeapowerMultiplayer
             // logic may re-assert it but never change it.
             if (Suppression.HostSuppressesRemoteTfAi(__instance)
                 && _remoteCommanded.TryGetValue(__instance.UniqueID, out int cmd)
-                && telegraph != cmd)
+                && telegraph != cmd
+                && !DoctrineCycle.Drives(__instance)) // the owner's standing order, not host AI
             {
                 __state = false;
                 return false;
@@ -341,6 +356,8 @@ namespace SeapowerMultiplayer
             if (OrderHandler.ApplyingFromNetwork) return true;
             if (!Suppression.HostSuppressesRemoteTfAi(__instance)
                 && !Suppression.ClientForeignUnit(__instance)) return true;
+            // Host: the remote player's own Sprint-and-Drift / Baffle-Clearing order.
+            if (!Suppression.ClientForeignUnit(__instance) && DoctrineCycle.Drives(__instance)) return true;
             __result = __instance._currentPresetDepth;
             return false;
         }
@@ -457,9 +474,41 @@ namespace SeapowerMultiplayer
     [HarmonyPatch(typeof(ObjectBase), nameof(ObjectBase.SetAttackAtWaypointTask),
         new[] { typeof(string), typeof(ObjectBase), typeof(GeoPosition), typeof(GeoPosition),
                 typeof(int), typeof(VisualActionTask), typeof(EngageTask.SalvoType),
-                typeof(float), typeof(bool), typeof(bool) })]
+                typeof(float), typeof(bool), typeof(bool), typeof(string), typeof(string) })]
     public static class Patch_ObjectBase_SetAttackAtWaypointTask
     {
+        /// <summary>Index of the `after` task in the unit's task list, captured in the
+        /// Prefix and reused by the Postfix.
+        ///
+        /// `after` is the whole of a QUEUE. Every chained drop - the shift-click chain
+        /// and the Ctrl/Alt pattern both - is issued as SetAttackAtWaypointTask(...,
+        /// after: the previously created task), and AttackingState.OffsetAttack threads
+        /// that chain through the RETURN VALUE (_lastSelectedTask). Nothing carried it,
+        /// so the host passed after=null for every drop and appended each one to the end
+        /// of the list instead of inserting it where the issuer put it. A queue laid over
+        /// an existing route, or onto a selected mid-route waypoint, therefore ran in a
+        /// different ORDER on the host than the map showed - the helicopter flew its
+        /// route past the drop markers and only reached the buoys at the end.
+        ///
+        /// An index, not an id: waypoint tasks have no UniqueID, and both machines apply
+        /// the same order stream to the same list, which is the addressing EditWaypoint
+        /// and DeleteWaypoint already rely on. -1 means "no anchor" (append), which is
+        /// also what the host falls back to if the index does not resolve.
+        ///
+        /// Captured in the Prefix on purpose: the Postfix runs after the new task has
+        /// been added, which shifts every index at or after the insertion point.</summary>
+        [ThreadStatic] static int _afterIndex;
+
+        static int IndexOfTask(ObjectBase u, VisualActionTask? after)
+        {
+            if (after == null) return -1;
+            var root = u._userRoot;
+            if (root == null) return -1;
+            for (int i = 0; i < root.TaskViewModels.Count; i++)
+                if (root.TaskViewModels[i].Task == after) return i;
+            return -1;
+        }
+
         static PlayerOrderMessage Msg(ObjectBase u, string ammunitionName, ObjectBase targetObject,
             GeoPosition targetGeoPosition, GeoPosition waypointGeoPosition, int salvo,
             EngageTask.SalvoType salvoType, float areaRadius, bool formationAttack, bool attackOnlyDetected)
@@ -479,19 +528,25 @@ namespace SeapowerMultiplayer
                 // The message is out of float fields, so the two attack flags ride in
                 // the high bits of the salvo type. They are only ever non-default on
                 // the WaypointData (mission/save import) overload, but dropping them
-                // would silently change what the host's task does.
+                // would silently change what the host's task does. The insertion index
+                // rides above them (+1 so that 0 still means "append"); Speed is a
+                // float, and every value here is far below 2^24, so it survives exactly.
                 Speed          = (int)salvoType
                                  | (formationAttack    ? 0x100 : 0)
-                                 | (attackOnlyDetected ? 0x200 : 0),
+                                 | (attackOnlyDetected ? 0x200 : 0)
+                                 | ((_afterIndex + 1) << 10),
                 Heading        = areaRadius,
             };
 
         static bool Prefix(ObjectBase __instance, ref AttackAtWaypoint __result,
                            string ammunitionName, ObjectBase targetObject,
                            GeoPosition targetGeoPosition, GeoPosition waypointGeoPosition,
-                           int salvo, EngageTask.SalvoType salvoType, float areaRadius,
+                           int salvo, VisualActionTask after,
+                           EngageTask.SalvoType salvoType, float areaRadius,
                            bool formationAttack, bool attackOnlyDetected)
         {
+            _afterIndex = IndexOfTask(__instance, after);
+
             if (OrderSyncHelper.Prefix(__instance, Msg(__instance, ammunitionName, targetObject,
                     targetGeoPosition, waypointGeoPosition, salvo, salvoType, areaRadius,
                     formationAttack, attackOnlyDetected)))
@@ -659,12 +714,44 @@ namespace SeapowerMultiplayer
             if (unit == null || unit.UniqueID == 0) return;
 
             bool isHost = Plugin.Instance.CfgIsHost.Value;
-            if (!isHost && !TaskforceAssignmentManager.ClientMayControl(unit)) return;
-            if (!Plugin.Instance.CfgPvP.Value && UnitLockManager.IsLockedByRemote(unit.UniqueID)) return;
+            if (FormationOwnership.BlocksOrdersFor(unit)) return;
+
+            // A unit this client does not own is a host-driven replica, and a waypoint
+            // change on one did not come from the player - it came from our own local
+            // sim, which ticks unit state machines outside the suppressed AI class. This
+            // path never asked, because it bypasses OrderSyncHelper.Prefix (where the
+            // same test has lived all along) and went out under the ownership gate
+            // alone - which is off entirely when LockUnitsToPlayers is false.
+            //
+            // The result was the client re-waypointing the OTHER side's fleet on the
+            // authoritative sim. NotTronic's host log, 0.3.7/protocol 232, with the lock
+            // off and no refusal in the whole file: 53 EditWaypoint orders applied to the
+            // host's own PLAAF/PLAN units (j-20a x21, j-35 x10, y-9lg x7, ss_type_039a
+            // x6, j-15dt x5, kj-600, j-15t) and 14 more to civilian traffic (dc-10, 707,
+            // il-62, ms_mercur, a fishing boat). That is "they decide to move and do
+            // whatever they want" from the other chair.
+            if (Suppression.ClientForeignUnit(unit)) return;
 
             var root = unit._userRoot;
             if (root == null || start < 0 || start >= root.TaskViewModels.Count) return;
             if (!(root.TaskViewModels[start].Task is GoToWaypointTask wp)) return;
+
+            // NOT attack/sonobuoy-drop waypoints. AttackAtWaypoint derives from
+            // GoToWaypointTask, so the test above accepts one, and this drag-sync then
+            // rewrote drop waypoints by LIST INDEX - addressing that is only stable for
+            // a route the player is editing. A queue of drops is the opposite: each task
+            // completes and leaves the list as the aircraft passes it, so the two
+            // machines' lists shrink at slightly different moments and an index that
+            // meant "the second buoy" on the client lands on a different task here.
+            // Verified live: a three-buoy queue logged EditWaypoint orders for the
+            // dropping helicopter interleaved with the drops themselves, on a unit whose
+            // task list held nothing but those three drops.
+            //
+            // Nothing is lost by skipping them - a drop waypoint's position already
+            // travels authoritatively in its own AttackAtWaypoint order. Only dragging
+            // an existing drop marker goes unsynced, which is a far smaller cost than
+            // scrambling a queue mid-flight.
+            if (wp is AttackAtWaypoint) return;
 
             // 20Hz throttle per unit - mark pending if too soon
             int uid = unit.UniqueID;
@@ -681,6 +768,14 @@ namespace SeapowerMultiplayer
 
         internal static void SendEditWaypoint(ObjectBase unit, int index, GoToWaypointTask wp)
         {
+            // Re-asserted here, not just at the call site above: the throttle defers a
+            // send into _pending, and StateBroadcaster's flush loop calls straight into
+            // this method up to 150 ms later - long enough for ownership to have moved,
+            // and a path that never saw the caller's guards at all.
+            if (unit == null) return;
+            if (FormationOwnership.BlocksOrdersFor(unit)) return;
+            if (Suppression.ClientForeignUnit(unit)) return;
+
             var geo = wp._waypointGeoPos.value;
             var msg = new PlayerOrderMessage
             {
@@ -737,16 +832,17 @@ namespace SeapowerMultiplayer
 
     /// <summary>In multiplayer, human-controlled taskforces launch aircraft only on
     /// explicit player orders - all autonomous air ops are suppressed for them.
-    /// Co-op: both players share _playerTaskforce (the enemy stays AI). PvP: the
-    /// "enemy" taskforce is the remote player, not an AI. Weapon self-defence
-    /// (auto SAM/CIWS engagement) is a separate path and stays active.</summary>
+    /// My own side is always human (I am on it); the other side is human only when
+    /// somebody is actually sitting there, which is what leaves an AI opponent's air
+    /// ops running normally. Weapon self-defence (auto SAM/CIWS engagement) is a
+    /// separate path and stays active.</summary>
     internal static class AutoAirOps
     {
         internal static bool IsHumanTaskforce(Taskforce tf)
         {
             if (tf == null) return false;
             if (tf == Globals._playerTaskforce) return true;
-            return Plugin.Instance.CfgPvP.Value && tf == Globals._enemyTaskforce;
+            return Teams.IsHumanControlled(tf);
         }
     }
 
@@ -768,13 +864,45 @@ namespace SeapowerMultiplayer
                     yield return m;
         }
 
-        static bool Prefix(ObjectBase __instance, ref bool __result)
+        static bool Prefix(ObjectBase __instance, ref bool __result, object[] __args)
         {
             if (!NetworkManager.Instance.IsEstablished) return true;
             if (!AutoAirOps.IsHumanTaskforce(__instance._taskforce)) return true;
+            // Mission Editor "Air Operations" (CivilianRoute with a home base) launch
+            // through FlightDeckLaunchUnit(string, ltp, ...) with ltp._civRoute set. That
+            // is the scenario's schedule, not AI autonomy, and the player's own decks run
+            // it in single player - left blocked, the route counted 50 failed launches
+            // and disabled itself. Host only: CivilianRoute.OnUpdate never runs on a client.
+            if (Plugin.Instance.CfgIsHost.Value && IsScenarioRoute(__args)) return true;
             __result = false; // "nothing launched" - callers stop or retry harmlessly
             return false;
         }
+
+        private static bool IsScenarioRoute(object[] args)
+        {
+            for (int i = 0; i < args.Length; i++)
+                if (args[i] is LaunchTaskParameters ltp) return ltp._civRoute != null;
+            return false;
+        }
+    }
+
+    /// <summary>The automation that DOES run for a human side now launches through
+    /// createLaunchTask on the host - Mission Editor Air Operations (CivilianRoute) and
+    /// the new patrol zones (PatrolZone.ProcessCAP / ProcessSAR ready, launch and RTB
+    /// aircraft for the zone's attached airbases, which may be a client's carrier). The
+    /// ownership gates on createLaunchTask and the order relays are written for player
+    /// clicks, so on a deck somebody else commands they refused the host's own
+    /// simulation - and put a refusal notice on the host's screen every retry. Both
+    /// run under Authority on the host, like any other host-authoritative replay;
+    /// their order side effects then broadcast to the owner as usual.</summary>
+    [HarmonyPatch(typeof(PatrolZone), nameof(PatrolZone.OnFixedUpdate))]
+    public static class Patch_PatrolZone_HostAuthority
+    {
+        static void Prefix(out IDisposable? __state) =>
+            __state = Plugin.Instance.CfgIsHost.Value && NetworkManager.Instance.IsEstablished
+                ? Authority.Allowed() : null;
+
+        static void Finalizer(IDisposable? __state) => __state?.Dispose();
     }
 
     [HarmonyPatch]
@@ -871,6 +999,10 @@ namespace SeapowerMultiplayer
                     DestZ          = ltp?._launchCount ?? 1,
                     ShotsToFire    = ltp != null ? (int)ltp._missionType : 0,
                     TargetEntityId = allowLaunch ? 1 : 0,
+                    TargetX        = LaunchWeaponState.Pack(),
+                    // Troops picked for a transport launch. The host's deck takes
+                    // them off the carrier when it creates the task.
+                    AmmoId         = GroundCargoWire.Encode(ltp?._groundCargo),
                 });
                 Telemetry.Count("v2.clientLaunchUpstream");
                 Plugin.Log.LogInfo($"[FlightOps] Upstream launch intent: carrier={v2vessel.UniqueID} vehicle={vehicleIdx} count={ltp?._launchCount ?? 1}");
@@ -897,6 +1029,83 @@ namespace SeapowerMultiplayer
         }
     }
 
+    /// <summary>Options → Gameplay "launch player aircraft on Weapons Free/Tight/Hold"
+    /// (OptionsManager.AircraftDefaultWeaponState). FlightDeck.launchVehicle reads it on
+    /// the machine running the deck - always the host - and only under
+    /// <c>_baseObject.IsPlayerObject</c>, so a client's launch came up on the HOST's
+    /// setting in co-op and on the remote-fleet fallback in PvP.
+    ///
+    /// The launching player's own setting rides the LaunchAircraft order (TargetX =
+    /// status + 1, 0 = none sent), is pinned to that launch's LaunchTaskParameters - the
+    /// very object the pending task later hands launchVehicle, so it survives the
+    /// ready-up wait - and is written after the game's own stamp (and after the PvP
+    /// fallback in Patch_V2_RemoteTf_LaunchWeaponStatus). A task restored from a save
+    /// has a fresh ltp and keeps the fallback.
+    ///
+    /// The client stamps its deck-phase replica with the same value: the doctrine sweep
+    /// (WeaponStatusSync) relays a replica's status upstream on first sight, so a
+    /// replica left at the field default would overwrite the host's correct value.</summary>
+    internal static class LaunchWeaponState
+    {
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<
+            LaunchTaskParameters, System.Runtime.CompilerServices.StrongBox<ObjectBase.WeaponStatus>> _requested = new();
+
+        /// <summary>This machine's option, mapped the way launchVehicle maps it.</summary>
+        internal static ObjectBase.WeaponStatus Local()
+        {
+            var opts = Singleton<OptionsManager>.InstanceExists(false)
+                ? Singleton<OptionsManager>.Instance : null;
+            if (opts == null) return ObjectBase.WeaponStatus.Tight;
+            return opts.AircraftDefaultWeaponState switch
+            {
+                AircraftWeaponState.Free => ObjectBase.WeaponStatus.Free,
+                AircraftWeaponState.Hold => ObjectBase.WeaponStatus.Hold,
+                _                        => ObjectBase.WeaponStatus.Tight,
+            };
+        }
+
+        internal static float Pack() => (int)Local() + 1;
+
+        /// <summary>Host: remember the sender's status for this launch.</summary>
+        internal static void Request(LaunchTaskParameters ltp, float packed)
+        {
+            if (ltp == null || packed < 1f) return;
+            _requested.Remove(ltp);
+            _requested.Add(ltp, new System.Runtime.CompilerServices.StrongBox<ObjectBase.WeaponStatus>(
+                (ObjectBase.WeaponStatus)((int)packed - 1)));
+        }
+
+        internal static bool TryGet(LaunchTaskParameters? ltp, out ObjectBase.WeaponStatus status)
+        {
+            status = default;
+            if (ltp == null || !_requested.TryGetValue(ltp, out var box)) return false;
+            status = box.Value;
+            return true;
+        }
+
+        /// <summary>Client: a deck-phase replica off a deck this player commands starts on
+        /// this player's launch setting, as it did on the host.</summary>
+        internal static void StampOwnDeckReplica(ObjectBase unit, ObjectBase homeBase)
+        {
+            if (unit == null || homeBase == null) return;
+            if (homeBase._taskforce != Globals._playerTaskforce) return;
+            if (FormationOwnership.IsOwnedByOther(homeBase)) return;
+            unit._weaponStatus = Local();
+        }
+    }
+
+    [HarmonyPatch(typeof(FlightDeck), nameof(FlightDeck.launchVehicle))]
+    public static class Patch_FlightDeck_LaunchVehicle_RequestedWeaponStatus
+    {
+        [HarmonyPriority(Priority.Last)]
+        static void Postfix(ObjectBase __result, LaunchTaskParameters ltp)
+        {
+            if (__result == null) return;
+            if (!LaunchWeaponState.TryGet(ltp, out var status)) return;
+            __result._weaponStatus = status;
+        }
+    }
+
     // ── FlightDeck.abortLaunchTask: client → host ───────────────────────────
     //
     // The client's Flight Ops queue mirrors the host's (FlightDeckStateApplier), and
@@ -909,10 +1118,23 @@ namespace SeapowerMultiplayer
     {
         static bool Prefix(FlightDeck __instance, System.Guid uid)
         {
+            var carrier = __instance._baseObject;
+
+            // OWNERSHIP FIRST, above the host/offline early-return. Aborting somebody
+            // else's readied flight is unit control exactly as ordering the carrier is,
+            // and this was the one flight-ops path with no gate on it at all: a client's
+            // press was relayed and refused upstream (silently, with no notice), while
+            // the HOST's press ran natively right here - so the host could cancel any
+            // player's launches. BlocksOrdersFor has no host exemption for that reason.
+            if (FormationOwnership.BlocksOrdersFor(carrier))
+            {
+                OrderRefusalNotice.Note(carrier);
+                return false;
+            }
+
             if (!Suppression.ClientActive) return true;        // host / offline: native
             if (OrderHandler.ApplyingFromNetwork) return true; // (safety - not used client-side)
 
-            var carrier = __instance._baseObject;
             if (carrier == null) return false;
 
             NetworkManager.Instance.SendToServer(new PlayerOrderMessage
@@ -1123,9 +1345,9 @@ namespace SeapowerMultiplayer
             // autoAttack is deliberately exempt: that is CIWS, SAM and auto-engage,
             // and a ship that stops defending itself because a partner clicked on it
             // would be far worse than the problem being fixed.
-            if (!autoAttack && UnitLockManager.BlocksOrdersFor(__instance))
+            if (!autoAttack && FormationOwnership.BlocksOrdersFor(__instance))
             {
-                UnitLockManager.NoteOrderRefused(__instance);
+                OrderRefusalNotice.Note(__instance);
                 Plugin.Log.LogInfo($"[Fire] Engage rejected: unit {__instance.UniqueID} locked by remote");
                 __state = true;
                 return true;
@@ -1140,14 +1362,19 @@ namespace SeapowerMultiplayer
                 return true;
             }
 
-            if (!TaskforceAssignmentManager.ClientMayControl(__instance))
-            {
-                Plugin.Log.LogInfo($"[Fire] Engage rejected: unit {__instance.UniqueID} not controllable (TF assignment)");
-                __state = true;
-                return true;
-            }
 
             SendClientFireOrder(__instance, ammoId, targetObject, targetPosition, shotsToFire);
+
+            // Play launch voiceover locally on guest (host plays its own in the real launch path)
+            if (__instance.IsPlayerObject)
+            {
+                float interval = Globals._weaponLaunchReportInterval;
+                if (GameTime.missionElapsedTime - Globals._weaponLaunchReportTime >= interval)
+                {
+                    Globals._weaponLaunchReportTime = GameTime.missionElapsedTime;
+                    Singleton<VoiceMessage>.Instance.PlayVoiceMessage("WeaponAway", __instance.getNation());
+                }
+            }
 
             // The postfix removes the local enqueue - the host owns execution; the
             // weapon returns as a replica via EntitySpawn.
@@ -1183,18 +1410,14 @@ namespace SeapowerMultiplayer
             // current position for that case, or the raw aim point for bearing fire.
             Vector3 aim = targetObject != null ? targetObject.transform.position : targetPosition;
 
-            // Mode-faithful coordinate encoding (matches the host's decode):
-            // PvP = GeoPosition (floating-origin safe), co-op = shared local coords.
-            float x, y, z;
-            if (Plugin.Instance.CfgPvP.Value)
-            {
-                var geo = Utils.worldPositionFromUnityToLongLat(aim, Globals._currentCenterTile);
-                x = (float)geo._longitude; y = (float)geo._height; z = (float)geo._latitude;
-            }
-            else
-            {
-                x = aim.x; y = aim.y; z = aim.z;
-            }
+            // ALWAYS GeoPosition (floating-origin safe). This used to be sent as raw
+            // local Unity coordinates in co-op, on the assumption that teammates share a
+            // coordinate frame - they do not. Globals._currentCenterTile is per-machine
+            // and shifts as each player's camera moves, so the two ends only agreed by
+            // luck. Geo is unconditional now; the matching decode is in
+            // OrderHandler.Apply (FireWeapon / DropSonobuoy).
+            var geo = Utils.worldPositionFromUnityToLongLat(aim, Globals._currentCenterTile);
+            float x = (float)geo._longitude, y = (float)geo._height, z = (float)geo._latitude;
 
             if (isSonobuoy)
             {
@@ -1239,8 +1462,7 @@ namespace SeapowerMultiplayer
 
             var unit = ____baseObject;
             if (unit == null) return;
-            if (!TaskforceAssignmentManager.ClientMayControl(unit)) return;
-            if (!Plugin.Instance.CfgPvP.Value && UnitLockManager.IsLockedByRemote(unit.UniqueID)) return;
+            if (FormationOwnership.BlocksOrdersFor(unit)) return;
 
             string ammo = __instance.ammunitionForEngage?.value;
             int salvo   = __instance.salvo?.value ?? 1;
@@ -1287,8 +1509,7 @@ namespace SeapowerMultiplayer
 
             var unit = ____baseObject;
             if (unit == null) return;
-            if (!TaskforceAssignmentManager.ClientMayControl(unit)) return;
-            if (!Plugin.Instance.CfgPvP.Value && UnitLockManager.IsLockedByRemote(unit.UniqueID)) return;
+            if (FormationOwnership.BlocksOrdersFor(unit)) return;
 
             string ammo = __instance.AmmunitionType?.value;
             var target  = __instance._targetObject?.value;
@@ -1371,9 +1592,18 @@ namespace SeapowerMultiplayer
             // never forward that decision to the host as a player order.
             if (Suppression.ClientForeignUnit(__instance)) return false;
 
-            // Co-op: block UI depth changes on units locked by remote player
-            if (!Plugin.Instance.CfgPvP.Value && UnitLockManager.IsLockedByRemote(__instance.UniqueID))
+            // Block UI depth changes on a unit a teammate is commanding
+            if (FormationOwnership.BlocksOrdersFor(__instance))
                 return false;
+
+            // Standing-order depth cycle: derived on both machines, so execute without
+            // sending - and on the host, past the remote-player lock below, which exists
+            // to stop host AI, not the owner's own doctrine. See DoctrineCycle.
+            if (DoctrineCycle.Drives(__instance))
+            {
+                _lockedDepth[__instance.UniqueID] = depth;
+                return true;
+            }
 
             // Host: the remote player owns the depth - the sub's own AI/state logic
             // may maintain the commanded depth, but never change it. (Without this,
@@ -1404,9 +1634,9 @@ namespace SeapowerMultiplayer
             // Ally lock: this patch does its own send rather than going through
             // OrderSyncHelper, so it has to ask as well - otherwise a depth change
             // on a unit the partner holds executes here and travels to them.
-            if (UnitLockManager.BlocksOrdersFor(__instance))
+            if (FormationOwnership.BlocksOrdersFor(__instance))
             {
-                UnitLockManager.NoteOrderRefused(__instance);
+                OrderRefusalNotice.Note(__instance);
                 return false;
             }
 
@@ -1417,10 +1647,11 @@ namespace SeapowerMultiplayer
 
             if (Plugin.Instance.CfgIsHost.Value) return true;
 
-            // PvP: don't sync weapon internals
-            if (Plugin.Instance.CfgPvP.Value && __instance is WeaponBase) return true;
+            // Never sync weapon internals as a player depth order. The mode test this
+            // used to carry was noise - a WeaponBase's depth is its own sim's business
+            // in any seating. OrderSyncHelper.Prefix already made the same broadening.
+            if (__instance is WeaponBase) return true;
 
-            if (!TaskforceAssignmentManager.ClientMayControl(__instance)) return false;
             NetworkManager.Instance.SendToServer(Msg(__instance, depth));
             return true;
         }
@@ -1548,21 +1779,25 @@ namespace SeapowerMultiplayer
             // here for one came from our own local sim (unit state machines tick
             // outside the suppressed AI class) - block it locally AND upstream.
             if (Suppression.ClientForeignUnit(unit)) return Refuse(msg, "clientForeignUnit");
-            // Co-op: block UI orders for units the remote player has selected (ally lock).
-            if (UnitLockManager.BlocksOrdersFor(unit))
+            // THE ownership gate. Position matters: above the `if (CfgIsHost) return true`
+            // further down, so it applies to the host's own input as well - the host is a
+            // player now, and every earlier form of unit locking exempted it and was
+            // wrong for it.
+            if (FormationOwnership.BlocksOrdersFor(unit))
             {
                 // The only refusal a player can actually cause, so the only one
                 // worth telling them about. The others below are internal
                 // suppression of orders the player never issued.
-                UnitLockManager.NoteOrderRefused(unit);
-                return Refuse(msg, "allyLock");
+                OrderRefusalNotice.Note(unit);
+                return Refuse(msg, "notOwner");
             }
             // Formation internals that both machines derive identically - execute, do
             // not send. Asked AFTER the ownership gates on purpose: those refusals must
             // still stand, so the client never mutates a unit it does not own.
             if (FormationInternal.Active) return true;
+            // Standing-order speed/depth cycle - same reasoning, see DoctrineCycle.
+            if (DoctrineCycle.Drives(unit)) return true;
             if (Plugin.Instance.CfgIsHost.Value) return true;
-            if (!TaskforceAssignmentManager.ClientMayControl(unit)) return Refuse(msg, "notMyTaskforce");
             if (!OrderDeduplicator.ShouldSend(msg)) return true; // duplicate - skip send, still execute locally
             NetworkManager.Instance.SendToServer(msg);
             return true;
@@ -1609,6 +1844,7 @@ namespace SeapowerMultiplayer
             }
 
             if (FormationInternal.Active) return; // derived formation state - see FormationInternal
+            if (DoctrineCycle.Drives(unit)) return; // derived standing-order cycle - see DoctrineCycle
             if (!Plugin.Instance.CfgIsHost.Value) return;
             if (!NetworkManager.Instance.IsConnected) return;
             if (OrderHandler.ApplyingFromNetwork) return;
@@ -1619,12 +1855,57 @@ namespace SeapowerMultiplayer
             // player's own switches and orders under them. (Motion is a separate
             // matter: the host still simulates those ships, so AI that steers them has
             // to be stopped at the AI itself, not here.)
-            if (Suppression.HostSuppressesRemoteTfAi(unit)) return;
+            if (Suppression.HostSuppressesRemoteTfAi(unit) && !CrossesRemoteTfGate(msg)) return;
             // Weapons are host-simulated and streamed in both modes - see Prefix.
             if (unit is WeaponBase) return;
             if (SessionManager.SceneLoading) return; // don't broadcast during scene load
             if (!OrderDeduplicator.ShouldSend(msg)) return; // duplicate - skip broadcast
-            NetworkManager.Instance.BroadcastToClients(msg);
+
+            // TEAM-SCOPED, not broadcast. This is the host commanding its own units, and
+            // an opponent has no business being told about it - a course change or a
+            // weapons-free order would reach them before any sensor of theirs could see
+            // it. That leak was invisible at two players because the only client WAS the
+            // opponent and the guard above already stopped their own units coming back.
+            var team = Teams.TeamOf(unit);
+            if (team.HasValue) NetworkManager.Instance.SendToTeam(team.Value, msg);
+            else NetworkManager.Instance.BroadcastToClients(msg); // neutral: nobody's secret
+        }
+
+        /// <summary>The one order that has to cross the remote-taskforce gate above.
+        ///
+        /// Formation membership is not the host deciding something on the other player's
+        /// behalf. It is bookkeeping the host's simulation DERIVES, because under
+        /// unified authority the host runs that player's fleet: FlightDeck.launchVehicle
+        /// forms a launch up into a Vic, a leader that dies is replaced, a flight that
+        /// recovers is torn down. All of that happens inside the host's sim, for units
+        /// the gate calls remote - so all of it was dropped, and the client's replicas
+        /// were never in the formation at all. A whole PvP client log went by without a
+        /// single FormationCommand arriving, which is the reported "the second F-14 did
+        /// not stay in formation with the first" and the ships that alternated between
+        /// "In formation" and "Loitering".
+        ///
+        /// EntitySpawn.FormationLeaderId already carries the join a launch makes, and it
+        /// is not a player order so the gate never saw it - but it covers that one join,
+        /// at spawn, and nothing after. Leader swap, detach, disband, rename and a
+        /// re-station have no other route to the client.
+        ///
+        /// CeaseFire and RecallAll are deliberately NOT here. Those carry a
+        /// player-visible weapons and station effect, and for them the gate's reasoning
+        /// holds exactly as written above: anything reaching this point for a remote-TF
+        /// unit came from host-side AI, and applying it would countermand orders the
+        /// other player gave. The structural ops change no order anyone issued.
+        ///
+        /// This does not reopen any of the self-sustaining sends the formation patches
+        /// document. OnUpdate station keeping is dropped at
+        /// Patch_UnitFormation_ReturnToFormation, leader reassignment at
+        /// FormationInternal (tested a few lines above this call), and the
+        /// station-keeping ChangeStationPosition callers by its setStationHeight filter.
+        /// What is left is one-shot.</summary>
+        private static bool CrossesRemoteTfGate(PlayerOrderMessage msg)
+        {
+            if (msg.Order != OrderType.FormationCommand) return false;
+            var op = (FormationOp)msg.ShotsToFire;
+            return op != FormationOp.CeaseFire && op != FormationOp.RecallAll;
         }
 
         internal static PlayerOrderMessage SensorMsg(ObjectBase u, int group, bool enable) =>
@@ -1716,7 +1997,16 @@ namespace SeapowerMultiplayer
             int group = GetRadarGroup(sensor, unit);
             if (group >= 0) return SensorMsg(unit, group, enable);
 
-            if (!(sensor is SensorSystemSonar)) return null;
+            // ECM rides the same per-sensor form. Switching a jammer off is a real
+            // decision since defensive noise jamming and home-on-jam: a radiating suite
+            // is what a HOJ seeker homes on (ObjectBase.HasNoiseJammer requireRadiating).
+            // Without this the client's switch was reverted by the sensor reassert.
+            // Client only: on the host the sim itself switches jammers on when a missile
+            // comes in (Missile terminal approach → sysECM.Enable()), and running that
+            // through the ownership gate would refuse it for every teammate-owned ship.
+            // The host's IsOn reaches clients through SensorStateManager regardless.
+            if (sensor is SensorSystemECM && Plugin.Instance.CfgIsHost.Value) return null;
+            if (!(sensor is SensorSystemSonar) && !(sensor is SensorSystemECM)) return null;
             var sensors = unit._obp?._sensorSystems;
             if (sensors == null) return null;
 
@@ -1814,6 +2104,14 @@ namespace SeapowerMultiplayer
                 // re-pointing a jammer from one contact to another fingerprints
                 // identically to the first order and would be dropped as a duplicate.
                 case OrderType.JamSystem:
+                // A reload is a one-shot click, and reloading the same mount twice is
+                // two reloads - its fingerprint (the mount index) never changes.
+                case OrderType.ForceReload:
+                // Weapon commands and launch settings carry their meaning in fields the
+                // default fingerprint does not read (op, weapon id, ammo) - two different
+                // commands to two different rounds would fingerprint the same.
+                case OrderType.WeaponCommand:
+                case OrderType.TorpedoLaunchSettings:
                     return true;
             }
 
@@ -1920,11 +2218,9 @@ namespace SeapowerMultiplayer
         {
             if (OrderHandler.ApplyingFromNetwork) return true;
             if (!NetworkManager.Instance.IsConnected) return true;
-            // Co-op: block sensor changes on units locked by remote player (ally)
-            if (!Plugin.Instance.CfgPvP.Value)
-                return !UnitLockManager.IsLockedByRemote(unit.UniqueID);
-            // PvP: only own-side units can change sensors
-            return unit._taskforce == Globals._playerTaskforce;
+            // Own side only, and not a unit somebody else on it commands.
+            if (unit._taskforce != Globals._playerTaskforce) return false;
+            return !FormationOwnership.BlocksOrdersFor(unit);
         }
 
         static bool Prefix(ObjectBase __instance) => AllowSensorChange(__instance);
@@ -2073,13 +2369,11 @@ namespace SeapowerMultiplayer
                 if (OrderHandler.ApplyingFromNetwork) return;
                 if (unit.UniqueID == 0) return;
                 if (SessionManager.SceneLoading) return;
-                // Own send path, so the ally lock has to be asked here too.
-                if (UnitLockManager.BlocksOrdersFor(unit)) return;
-                // ...and the ownership test the radar path gets from OrderSyncHelper.
+                // Own send path, so the ownership gate has to be asked here too.
+                if (FormationOwnership.BlocksOrdersFor(unit)) return;
+                // ...and the own-side test the radar path gets from OrderSyncHelper.
                 // Without it the client relayed sonar flips its own local sim made on
-                // the remote player's units, and the host applied them to its real
-                // ships. ClientMayControl is no substitute: no task force is ever
-                // assigned, so it returns true for everything.
+                // an opponent's units, and the host applied them to its real ships.
                 if (Suppression.ClientForeignUnit(unit)) return;
 
                 var msg = OrderSyncHelper.SensorMsg(unit, 2, active);
@@ -2092,7 +2386,7 @@ namespace SeapowerMultiplayer
                 }
                 else
                 {
-                    if (TaskforceAssignmentManager.ClientMayControl(unit) &&
+                    if (!FormationOwnership.BlocksOrdersFor(unit) &&
                         NetworkManager.Instance != null &&
                         OrderDeduplicator.ShouldSend(msg))
                         NetworkManager.Instance.SendToServer(msg);
@@ -2217,13 +2511,16 @@ namespace SeapowerMultiplayer
                 if (Plugin.Instance.CfgIsHost.Value) return true;
 
                 // message=false is the missile-evasion states, not the player
-                // (InputHandler and the weapons panel both pass true). Incoming
-                // missile REPLICAS register as threats, so the client's aircraft
-                // enter evasion locally and were originating chaff decisions of
-                // their own. In co-op the host runs the same evasion AI for this
-                // aircraft and chaffs natively - drop the duplicate. PvP keeps
-                // auto-chaff by design, so it still forwards.
-                if (!message && !Plugin.Instance.CfgPvP.Value) return false;
+                // (InputHandler and the weapons panel both pass true). Incoming missile
+                // REPLICAS register as threats, so the client's aircraft enter evasion
+                // locally and were originating chaff decisions of their own.
+                //
+                // Whether that duplicate matters depends on whether the HOST is running
+                // this aircraft's evasion AI, and it only does so for its OWN side:
+                // HostSuppressesRemoteTfAi silences the AI of any human-controlled
+                // opposing taskforce, so nobody would chaff for us at all. So a teammate
+                // of the host drops the duplicate, and an opponent must still forward.
+                if (!message && !Teams.LocalSaveSwapped) return false;
 
                 NetworkManager.Instance.SendToServer(new PlayerOrderMessage
                 {
@@ -2235,6 +2532,57 @@ namespace SeapowerMultiplayer
             }
 
             return true;
+        }
+    }
+
+    // ── Manual noisemaker from the weapons panel (client → host) ────────────
+    //
+    // The OTHER half of the manual noisemaker. Patch_InputHandler_NoisemakerUpstream
+    // covers the HOTKEY, which builds its EngageTask inline
+    // (InputHandler.OnUpdate → AddEngageTask) and never touches a hookable method.
+    // The weapons-panel BUTTON takes a completely different route - WeaponEntry's
+    // DelegateCommand calls ObjectBase.LaunchNoisemaker(ammo) - so nothing captured
+    // it and a client clicking the button sent nothing at all. The local call is
+    // inert on the client (LaunchNoisemaker just queues an EngageTask, and
+    // HandleEngageTasks is host-only), which is why the button looked dead however
+    // many times it was pressed while the same ship launched fine from the host.
+    //
+    // Mirrors the chaff patch: forward the click, let the host launch natively, and
+    // the decoy comes back as a replicated spawn. No double-send with the hotkey
+    // patch - the two paths do not overlap. The AI's torpedo-evasion decoys go
+    // through Vessel/Submarine.launchNoisemaker(), a different method this does not
+    // touch, so auto-defence is unaffected (the client's is already suppressed).
+    [HarmonyPatch(typeof(ObjectBase), nameof(ObjectBase.LaunchNoisemaker))]
+    public static class Patch_ObjectBase_LaunchNoisemaker
+    {
+        static bool Prefix(ObjectBase __instance, string ammoForEngageName)
+        {
+            if (OrderHandler.ApplyingFromNetwork) return true;
+            if (!NetworkManager.Instance.IsEstablished) return true;
+            if (Plugin.Instance.CfgIsHost.Value) return true; // host launches natively
+
+            // Safe to gate, unlike Vessel/Submarine.launchNoisemaker (lowercase), which
+            // the AI's torpedo-evasion states call and which is deliberately left alone -
+            // see the note at the bottom of this file. This overload is the weapons-panel
+            // BUTTON only, so anything reaching it is a player's click.
+            if (FormationOwnership.BlocksOrdersFor(__instance))
+            {
+                OrderRefusalNotice.Note(__instance);
+                return false;
+            }
+
+            // The ammo the player actually picked - a ship can carry more than one
+            // noisemaker type, and the host's fallback would otherwise choose for them.
+            NetworkManager.Instance.SendToServer(new PlayerOrderMessage
+            {
+                SourceEntityId = __instance.UniqueID,
+                Order          = OrderType.LaunchNoisemaker,
+                AmmoId         = ammoForEngageName ?? "",
+            });
+            Telemetry.Count("v2.clientNoisemakerUpstream");
+            Plugin.Log.LogInfo($"[Decoy] Upstream LaunchNoisemaker: unit={__instance.UniqueID} " +
+                               $"ammo={ammoForEngageName}");
+            return false; // host owns the launch; the decoy returns as a spawn
         }
     }
 
@@ -2309,7 +2657,7 @@ namespace SeapowerMultiplayer
             var unit = Singleton<RenderPosition>.InstanceExists()
                 ? Singleton<RenderPosition>.Instance.getSelectedObject() : null;
             if (unit == null || !unit.isUnit() || !unit.AcceptsOrdersFromPlayer) return;
-            if (!TaskforceAssignmentManager.ClientMayControl(unit)) return;
+            if (FormationOwnership.BlocksOrdersFor(unit)) { OrderRefusalNotice.Note(unit); return; }
             if (!HasAvailableNoisemaker(unit)) return; // host launchNoisemaker would no-op
 
             NetworkManager.Instance.SendToServer(new PlayerOrderMessage
@@ -2367,9 +2715,10 @@ namespace SeapowerMultiplayer
 
         static void Prefix(Vehicle __instance)
         {
-            if (!Plugin.Instance.CfgPvP.Value) return;
+            // Only a swapped (Red) guest has the stale-ECS-taskforce problem this
+            // corrects; LocalSaveSwapped already implies we are not the host.
+            if (!Teams.LocalSaveSwapped) return;
             if (!NetworkManager.Instance.IsConnected) return;
-            if (Plugin.Instance.CfgIsHost.Value) return;
             if (RpValueField == null) return;
 
             // Pre-set backing field to what UpdateFromECS will write.
@@ -2381,9 +2730,10 @@ namespace SeapowerMultiplayer
 
         static void Postfix(Vehicle __instance)
         {
-            if (!Plugin.Instance.CfgPvP.Value) return;
+            // Only a swapped (Red) guest has the stale-ECS-taskforce problem this
+            // corrects; LocalSaveSwapped already implies we are not the host.
+            if (!Teams.LocalSaveSwapped) return;
             if (!NetworkManager.Instance.IsConnected) return;
-            if (Plugin.Instance.CfgIsHost.Value) return;
             if (__instance.Object == null || __instance.Object._taskforce == null) return;
             if (RpValueField == null) return;
 
@@ -2447,7 +2797,11 @@ namespace SeapowerMultiplayer
     {
         internal static bool IsEnemyFormation(UnitFormation formation)
         {
-            if (!Plugin.Instance.CfgPvP.Value) return false;
+            // Kept gated on the save swap, NOT widened to every session: the stale-ECS
+            // leakage this hides only happens on a swapped guest, and blanking these
+            // markers unconditionally would also hide enemy formations a co-op player
+            // has legitimately detected.
+            if (!Teams.LocalSaveSwapped) return false;
             if (!NetworkManager.Instance.IsConnected) return false;
             return formation?._taskforce != null
                 && formation._taskforce != Globals._playerTaskforce;
@@ -2500,74 +2854,19 @@ namespace SeapowerMultiplayer
     // The formation is already hidden via IsValid=false and Lat/Lng=NaN,
     // so connection lines don't render even without clearing the collection.
 
-    // ── Unit Selection Broadcast (Co-op) ─────────────────────────────────────
+    // The selection-broadcast patches lived here. They claimed a unit for whoever had
+    // it selected and released it on deselect - a transient lock that made sense only
+    // while the choice was "share everything" or "share nothing". Ownership is
+    // persistent and per formation now, and with the lock off the session is a
+    // free-for-all, so a selection-following claim had nothing left to arbitrate and
+    // would only have fought both. GameEventType.UnitSelected/UnitDeselected stay
+    // reserved in the enum and are ignored on receipt.
+    //
+    // 0.3.7 re-added these with a weapon exemption ("never claim a torpedo - a
+    // wire-guided round is steered from its panel while it runs"). The patches stay
+    // retired, but that exemption was a real fix and is kept: it now lives in
+    // FormationOwnership.BlocksOrdersFor and in the IsControllable patch below.
 
-    [HarmonyPatch(typeof(RenderPosition), nameof(RenderPosition.switchToObject))]
-    public static class Patch_RenderPosition_SwitchToObject
-    {
-        static void Postfix(ObjectBase objectToAttach)
-        {
-            if (Plugin.Instance.CfgPvP.Value) return;
-            if (!NetworkManager.Instance.IsConnected) return;
-            if (objectToAttach == null) return;
-
-            // Verify the selection actually took effect
-            var current = Singleton<RenderPosition>.Instance.SelectedObject;
-            if (current == null || current.UniqueID != objectToAttach.UniqueID) return;
-
-            int newId = objectToAttach.UniqueID;
-            int previousClaim = UnitLockManager.LocalControlledUnitId;
-
-            // If the remote player already controls this unit, we're only spectating -
-            // don't broadcast a claim (would cause both sides to see each other as remote-locked).
-            if (UnitLockManager.IsLockedByRemote(newId))
-            {
-                // Release any prior claim so the remote knows we've let go.
-                if (previousClaim != 0 && previousClaim != newId)
-                {
-                    NetworkManager.Instance.SendToOther(new GameEventMessage
-                    {
-                        EventType = GameEventType.UnitDeselected,
-                        Param     = (float)previousClaim,
-                    });
-                    UnitLockManager.ClearLocalControlled();
-                }
-                return;
-            }
-
-            // Claim control of the new unit. UnitSelected overwrites the remote's
-            // tracked ID, so we don't need a separate deselect for any prior claim.
-            if (previousClaim == newId) return; // already claimed, skip redundant broadcast
-            NetworkManager.Instance.SendToOther(new GameEventMessage
-            {
-                EventType = GameEventType.UnitSelected,
-                Param     = (float)newId,
-            });
-            UnitLockManager.SetLocalControlled(newId);
-        }
-    }
-
-    [HarmonyPatch(typeof(RenderPosition), nameof(RenderPosition.deselectObjectAndDetachCamera))]
-    public static class Patch_RenderPosition_DeselectObjectAndDetachCamera
-    {
-        static void Prefix()
-        {
-            if (Plugin.Instance.CfgPvP.Value) return;
-            if (!NetworkManager.Instance.IsConnected) return;
-
-            // Only release a claim we actually made. If we were spectating a
-            // remote-controlled unit, _localControlledUnitId is 0 and we stay silent.
-            int claimed = UnitLockManager.LocalControlledUnitId;
-            if (claimed == 0) return;
-
-            NetworkManager.Instance.SendToOther(new GameEventMessage
-            {
-                EventType = GameEventType.UnitDeselected,
-                Param     = (float)claimed,
-            });
-            UnitLockManager.ClearLocalControlled();
-        }
-    }
 
     // ── IsControllable override (Co-op) ──────────────────────────────────────
 
@@ -2582,7 +2881,6 @@ namespace SeapowerMultiplayer
     {
         static void Postfix(ObjectBase __instance, ref bool __result)
         {
-            if (Plugin.Instance.CfgPvP.Value) return;
             if (!NetworkManager.Instance.IsConnected) return;
             if (__instance == null) return;
             // Host is authoritative: it must execute client-originated orders to
@@ -2602,8 +2900,50 @@ namespace SeapowerMultiplayer
             // with an IndexOutOfRange and left the client on a dead loading screen.
             // A lock is about live order entry; it has no business filtering a restore.
             if (SessionManager.SceneLoading) return;
-            if (UnitLockManager.IsLockedByRemote(__instance.UniqueID))
+
+            // Weapons are never owned - see FormationOwnership.BlocksOrdersFor. A
+            // torpedo rendered uncontrollable here takes its guidance panel with it,
+            // so the owner could no longer steer their own wire-guided round.
+            if (__instance is WeaponBase) return;
+
+            // Setting IsControllable false is what gets the game's OWN ally treatment
+            // for free - MapContactVisuals.Classify already picks the Allied palette
+            // over Friendly from exactly this flag, and Order.setOrder refuses order
+            // entry on it.
+            if (FormationOwnership.IsOwnedByOther(__instance))
                 __result = false;
+        }
+    }
+
+    /// <summary>
+    /// The HOST's half of ally rendering.
+    ///
+    /// The host cannot use the IsControllable route above - forcing that flag false on
+    /// the machine that runs the simulation is destructive well beyond colour: engage
+    /// tasks queued mid-tick are dropped (Order.setOrder), AcceptOrdersFromAI goes false,
+    /// UnitFormation station-keeping skips the unit, and the taskforce air sweeps skip it
+    /// too. So the host recolours the marker instead and leaves the sim alone - at the one
+    /// place that decides it, MapContactVisuals.Classify, which both the contact and its
+    /// wake mark go through.
+    ///
+    /// Only the FRIENDLY palette is intercepted. Dormancy, destroyed, unknown and enemy
+    /// all classify differently and pass straight through, so none of their meanings are
+    /// overwritten.
+    /// </summary>
+    [HarmonyPatch(typeof(MapContactVisuals), nameof(MapContactVisuals.Classify))]
+    public static class Patch_MapContactVisuals_AllyColour
+    {
+        static void Postfix(IUnit unit, ref (MapVisualPosture Posture, MapUnitPalette Palette) __result)
+        {
+            if (!Plugin.Instance.CfgIsHost.Value) return;   // clients get it from IsControllable
+            if (!NetworkManager.Instance.IsConnected) return;
+            if (__result.Palette != MapUnitPalette.Friendly) return;
+
+            var obj = unit?.BaseObject as ObjectBase;
+            if (obj == null) return;
+            if (!FormationOwnership.IsOwnedByOther(obj)) return;
+
+            __result.Palette = MapUnitPalette.Allied;
         }
     }
 
@@ -2611,11 +2951,12 @@ namespace SeapowerMultiplayer
     //
     // When the remote player selects a unit, we tag its map label with "[ALLY]"
     // so the local player can see at a glance which contact their partner is
-    // driving. The registry tracks live VMs so UnitLockManager can fire a
+    // driving. The registry tracks live VMs so FormationOwnership can fire a
     // PropertyChanged and make Noesis re-read ContactInfoLine2.
 
     [HarmonyPatch(typeof(MapUnitViewModel), MethodType.Constructor,
-        new[] { typeof(Taskforce), typeof(Vehicle), typeof(ReactiveProperty<ISelectableObject>), typeof(bool) })]
+        new[] { typeof(SeapowerUI.MapViewModel), typeof(Taskforce), typeof(Vehicle),
+                typeof(ReactiveProperty<ISelectableObject>), typeof(bool), typeof(MapLabelRegistry) })]
     public static class Patch_MapUnitViewModel_Ctor
     {
         static void Postfix(MapUnitViewModel __instance) =>
@@ -2634,11 +2975,20 @@ namespace SeapowerMultiplayer
     {
         static void Postfix(MapUnitViewModel __instance, ref string __result)
         {
-            if (Plugin.Instance.CfgPvP.Value) return;
             if (!NetworkManager.Instance.IsConnected) return;
             var obj = __instance.Unit?.BaseObject as ObjectBase;
-            if (obj != null && UnitLockManager.IsLockedByRemote(obj.UniqueID))
-                __result = "[ALLY]";
+            if (obj == null) return;
+
+            // Name the owner rather than saying "[ALLY]": with up to three teammates,
+            // knowing a unit is somebody else's is far less useful than knowing WHOSE it
+            // is - and that is the whole basis of handing formations around.
+            if (FormationOwnership.IsOwnedByOther(obj))
+            {
+                __result = $"[{FormationOwnership.OwnerName(obj)}]";
+                return;
+            }
+
+
         }
     }
 
@@ -2690,22 +3040,29 @@ namespace SeapowerMultiplayer
     // Client-only: on the host the player's change flows back to the client through
     // the 10 Hz entity stream (Telegraph/velocity), so no host broadcast is needed -
     // and the host's AI calls SetSpeedCommand every tick, which we must not echo.
-    [HarmonyPatch(typeof(ObjectBase), nameof(ObjectBase.SetSpeedCommand))]
+    //
+    // Speed orders are value structs now; the generic SetSpeedCommand<T> overload only
+    // converts to a SpeedRequest and forwards here, so this one overload sees them all.
+    [HarmonyPatch(typeof(ObjectBase), nameof(ObjectBase.SetSpeedCommand),
+        new[] { typeof(SpeedRequest) }, new[] { ArgumentType.Ref })]
     public static class Patch_Aircraft_SetSpeedCommand
     {
-        static bool Prefix(ObjectBase __instance, ISpeedCommand speedCommand)
+        static bool Prefix(ObjectBase __instance, ref SpeedRequest request)
         {
             if (OrderHandler.ApplyingFromNetwork) return true;
             if (!NetworkManager.Instance.IsConnected) return true;
             if (Plugin.Instance.CfgIsHost.Value) return true; // host: stream carries aircraft speed
             if (SessionManager.SceneLoading) return true;
+            // Formation physics re-commands every wingman to the leader's mach each
+            // tick - the leader's order, not the player's.
+            if (Patch_V2_Client_FormationFlight_KeepOwnCommand.Running) return true;
             if (!(__instance is Aircraft ac)) return true;
-            if (!(speedCommand is ConstantMach cm)) return true;
+            if (request.Kind != SpeedKind.Mach) return true;
 
             var speeds = ac.Ap?._speedValuesInMach;
             if (speeds == null) return true;
 
-            int idx = Array.IndexOf(speeds, cm.SpeedInMach);
+            int idx = Array.IndexOf(speeds, request.Value);
             if (idx < 0) return true; // not a player preset (AI/continuous value) - don't sync
 
             // Host applies via setTelegraph((int)Speed); Aircraft.setTelegraph does
@@ -2919,6 +3276,198 @@ namespace SeapowerMultiplayer
         }
     }
 
+    // ── In-flight weapon commands (client → host) ───────────────────────────
+    //
+    // A wire-guided torpedo (or a datalinked missile / command-guided bomb) is steered
+    // from its own panel and from map clicks while it runs: cut wire, self-destruct,
+    // wire speed and depth, retarget onto a contact or a point. Every one of those is a
+    // public method on the weapon, and on a client the weapon is a host-driven replica
+    // - so each ran on the local copy and went nowhere. Nothing even refused it:
+    // OrderSyncHelper waves weapons through, because no order may be ADDRESSED to one
+    // (both ends treat a weapon id as misresolved). So the round is addressed through
+    // its launch platform instead, which is also the right thing to ask the ownership
+    // gates about.
+    //
+    // Client only. The host's own commands run natively on the real round, and the
+    // result streams back like any other weapon state; the wire itself comes back as
+    // WeaponWireLost (WireStateCapture).
+    public static class WeaponCommandSync
+    {
+        /// <summary>True when this call is a player's command to a client replica and
+        /// has been claimed for the host. <paramref name="allowed"/> is the ownership
+        /// verdict - false means it was refused and must not run locally either.</summary>
+        internal static bool TryForward(WeaponBase wb, WeaponOp op, out bool allowed,
+            float arg = 0f, ObjectBase? target = null, GeoPosition geo = default)
+        {
+            allowed = true;
+            if (OrderHandler.ApplyingFromNetwork) return false;
+            if (!NetworkManager.Instance.IsEstablished) return false;
+            if (Plugin.Instance.CfgIsHost.Value) return false;
+            if (SessionManager.SceneLoading) return false; // Torpedo.RestoreSavedState replays these
+            if (ReplicaRegistry.PolicyOf(wb) != ReplicaPolicy.KinematicWeapon) return false;
+
+            var platform = StateSerializer.GetLaunchPlatform(wb);
+            if (platform == null || platform.UniqueID == 0)
+            {
+                Plugin.Log.LogWarning($"[Weapon] {op} on {wb.name} (id={wb.UniqueID}) dropped - " +
+                    "launch platform unknown here, nothing to address it through");
+                allowed = false;
+                return true;
+            }
+
+            allowed = OrderSyncHelper.Prefix(platform, new PlayerOrderMessage
+            {
+                SourceEntityId = platform.UniqueID,
+                Order          = OrderType.WeaponCommand,
+                ShotsToFire    = wb.UniqueID,
+                Heading        = (float)op,
+                Speed          = arg,
+                TargetEntityId = target != null ? target.UniqueID : 0,
+                TargetX        = (float)geo._longitude,
+                TargetY        = (float)geo._height,
+                TargetZ        = (float)geo._latitude,
+            });
+            if (allowed)
+                Plugin.Log.LogInfo($"[Weapon] Upstream {op}: weapon={wb.UniqueID} platform={platform.UniqueID} " +
+                    $"arg={arg} target={target?.UniqueID ?? 0}");
+            return true;
+        }
+    }
+
+    // The cut also runs on the replica: BreakWire is pure state (_onWire and the two
+    // ConnectionLost flags), and it is what takes the button and the wire controls
+    // off the panel at once instead of a round trip later.
+    [HarmonyPatch(typeof(WeaponBase), nameof(WeaponBase.CommandCutWire))]
+    public static class Patch_V2_WeaponCutWire_Upstream
+    {
+        static bool Prefix(WeaponBase __instance)
+            => !WeaponCommandSync.TryForward(__instance, WeaponOp.CutWire, out bool allowed) || allowed;
+    }
+
+    // Never locally: the replica may only be destroyed by the host's impact/despawn.
+    [HarmonyPatch(typeof(WeaponBase), nameof(WeaponBase.CommandSelfDestruct))]
+    public static class Patch_V2_WeaponSelfDestruct_Upstream
+    {
+        static bool Prefix(WeaponBase __instance)
+            => !WeaponCommandSync.TryForward(__instance, WeaponOp.SelfDestruct, out _);
+    }
+
+    // Speed and depth also run locally - both only set the values the torpedo control
+    // panel reads back (SpeedSetting, OrderedWireDepthFeet); the replica's sim is off.
+    // The AI's TorpedoWireController calls the same two methods, which is why the
+    // ownership gate in TryForward matters: it refuses them for a boat we do not own.
+    [HarmonyPatch(typeof(Torpedo), nameof(Torpedo.SetWireSpeedSetting))]
+    public static class Patch_V2_TorpedoWireSpeed_Upstream
+    {
+        static bool Prefix(Torpedo __instance, int index)
+            => !WeaponCommandSync.TryForward(__instance, WeaponOp.WireSpeed, out bool allowed, index) || allowed;
+    }
+
+    [HarmonyPatch(typeof(Torpedo), nameof(Torpedo.OrderWireDepth))]
+    public static class Patch_V2_TorpedoWireDepth_Upstream
+    {
+        static bool Prefix(Torpedo __instance, float depthInFeet)
+            => !WeaponCommandSync.TryForward(__instance, WeaponOp.WireDepth, out bool allowed, depthInFeet) || allowed;
+    }
+
+    // Retargets do not run locally: a missile's SetNewTarget claims and frees guidance
+    // channels on the shooter, which on this machine is a puppet.
+    [HarmonyPatch(typeof(WeaponBase), nameof(WeaponBase.RetargetWeapon))]
+    public static class Patch_V2_WeaponRetarget_Upstream
+    {
+        static bool Prefix(WeaponBase __instance, ObjectBase targetObject, ref bool __result)
+        {
+            if (!WeaponCommandSync.TryForward(__instance, WeaponOp.Retarget, out bool allowed, target: targetObject))
+                return true;
+            __result = allowed;
+            return false;
+        }
+    }
+
+    [HarmonyPatch(typeof(WeaponBase), nameof(WeaponBase.RetargetWeaponToGeoPosition))]
+    public static class Patch_V2_WeaponRetargetGeo_Upstream
+    {
+        static bool Prefix(WeaponBase __instance, GeoPosition targetGeoPosition)
+            => !WeaponCommandSync.TryForward(__instance, WeaponOp.RetargetGeo, out _, geo: targetGeoPosition);
+    }
+
+    // ── Torpedo launch settings (client → host) ─────────────────────────────
+    //
+    // Seeker selection (Auto / primary / vessel-attack seeker), launch speed, search
+    // depth and search mode are chosen per ammunition in the weapon context menu and
+    // stored on the LAUNCHING UNIT (ObjectBase._launchSeekerModeSettings and its three
+    // siblings), where the launch reads them: WeaponBase.CommonLaunchSettings for the
+    // seeker, Torpedo.TorpedoLaunchSettings for the rest. The launch happens on the
+    // host, so a client's choice made on its own copy of the unit never reached it -
+    // the host fired every torpedo on its defaults.
+    //
+    // The menu items are DelegateCommands built by local functions of
+    // WeaponEntry.GetSalvoCommands, each a bare dictionary write with no method of its
+    // own to hook. So the factory is postfixed and its command wrapped: the ownership
+    // gate runs first, then the original write, and the new value is taken from the
+    // factory's own arguments. (Search mode is behind UNITY_EDITOR in the menu today;
+    // its factory still ships, so it is covered for when the menu opens up.)
+    [HarmonyPatch]
+    public static class Patch_V2_TorpedoLaunchSettings_Upstream
+    {
+        // Factory name fragment → message field it fills (see OrderType.TorpedoLaunchSettings)
+        private static readonly Dictionary<string, int> Settings = new()
+        {
+            ["g__GetSetLaunchSeekerModeCommand"] = 0,
+            ["g__GetSetLaunchSpeedCommand"]      = 1,
+            ["g__GetSetSearchDepthCommand"]      = 2,
+            ["g__GetSetSearchModeCommand"]       = 3,
+        };
+
+        static IEnumerable<MethodBase> TargetMethods()
+        {
+            var type = AccessTools.TypeByName("SeapowerUI.ViewModels.WeaponEntry");
+            if (type == null)
+            {
+                Plugin.Log.LogWarning("[Patch] WeaponEntry not found - torpedo launch settings will not sync");
+                yield break;
+            }
+            foreach (var m in AccessTools.GetDeclaredMethods(type))
+            {
+                foreach (var name in Settings.Keys)
+                    if (m.Name.Contains(name)) { yield return m; break; }
+            }
+        }
+
+        static void Postfix(MethodBase __originalMethod, object[] __args,
+                            ref System.Windows.Input.ICommand __result)
+        {
+            if (__result == null || __args.Length < 3) return;
+            if (!(__args[0] is ObjectBase unit) || !(__args[1] is AmmunitionParameters ap)) return;
+
+            int field = -1;
+            foreach (var kv in Settings)
+                if (__originalMethod.Name.Contains(kv.Key)) { field = kv.Value; break; }
+            if (field < 0) return;
+
+            float value = Convert.ToInt32(__args[2]);
+            var inner = __result;
+            __result = new DelegateCommand(p =>
+            {
+                if (NetworkManager.Instance.IsConnected && unit.UniqueID != 0)
+                {
+                    var msg = new PlayerOrderMessage
+                    {
+                        SourceEntityId = unit.UniqueID,
+                        Order          = OrderType.TorpedoLaunchSettings,
+                        AmmoId         = ap._ammunitionFileName,
+                        Speed          = field == 0 ? value : float.NaN,
+                        Heading        = field == 1 ? value : float.NaN,
+                        DestX          = field == 2 ? value : float.NaN,
+                        DestY          = field == 3 ? value : float.NaN,
+                    };
+                    if (!OrderSyncHelper.Prefix(unit, msg)) return;
+                }
+                inner.Execute(p);
+            });
+        }
+    }
+
     [HarmonyPatch(typeof(Vehicle), nameof(Vehicle.OverrideRelationship))]
     public static class Patch_Vehicle_OverrideRelationship
     {
@@ -2937,20 +3486,19 @@ namespace SeapowerMultiplayer
                 Speed          = (float)forcedState,
             };
 
-            // NOT OrderSyncHelper: its client path gates on ClientForeignUnit and
-            // ClientMayControl, both of which reject the object here - the target
-            // of a classification is a CONTACT, i.e. by definition a unit the
-            // player does not own. Routed through it, the client's own
-            // Hostile/Neutral calls were dropped and only the host's ever
-            // travelled, so classification appeared one-way.
+            // NOT OrderSyncHelper: its client path gates on ClientForeignUnit and the
+            // ownership check, both of which reject the object here - the target of a
+            // classification is a CONTACT, i.e. by definition a unit the player does not
+            // own. Routed through it, the client's own Hostile/Neutral calls were dropped
+            // and only the host's ever travelled, so classification appeared one-way.
             if (!NetworkManager.Instance.IsConnected) return;
 
-            // Co-op only. In PvP a classification is about the OTHER player's unit,
+            // Teammates only. A classification is about the OTHER side's unit,
             // and StateSerializer resolves the incoming id against the receiver's own
             // plotting table - so the host marking an enemy destroyer Hostile made
             // that player's own ship render as hostile on their own map, on top of
             // telling them they had been spotted and classified.
-            if (Plugin.Instance.CfgPvP.Value) return;
+            if (!Teams.HasTeammates) return;
 
             if (!OrderDeduplicator.ShouldSend(msg)) return;
 
@@ -2975,7 +3523,7 @@ namespace SeapowerMultiplayer
         internal static void BroadcastFormationMembers(ObjectBase baseObj, RelationsState forcedState)
         {
             if (!Plugin.Instance.CfgIsHost.Value) return;
-            if (Plugin.Instance.CfgPvP.Value) return;
+            if (!Teams.HasTeammates) return;
             if (!NetworkManager.Instance.IsConnected) return;
 
             // Same gate the game's own fan-out uses: air unit, in a formation,
@@ -3169,4 +3717,59 @@ namespace SeapowerMultiplayer
             return true;
         }
     }
+
+    /// <summary>
+    /// Flight-ops launches are a PLAYER CLICK on the host, and never travel as an order
+    /// there, so no send-side gate can see them. Caught at the effect instead.
+    ///
+    /// Safe to gate here only because autonomous launches were already suppressed for
+    /// any human-commanded side (AutoAirOps.IsHumanTaskforce), so what remains reaching
+    /// this method for such a taskforce IS somebody's click. The equivalent gate is NOT
+    /// applied to launchNoisemaker for exactly the opposite reason - see below.
+    /// </summary>
+    [HarmonyPatch(typeof(FlightDeck), nameof(FlightDeck.createLaunchTask))]
+    public static class Patch_FlightDeck_CreateLaunchTask_Ownership
+    {
+        static bool Prefix(FlightDeck __instance)
+        {
+            var carrier = __instance?._baseObject;
+            if (!FormationOwnership.BlocksOrdersFor(carrier)) return true;
+            OrderRefusalNotice.Note(carrier);
+            return false;
+        }
+    }
+
+    /// <summary>The LAUNCH button on a readied flight, gated the same way.
+    ///
+    /// createLaunchTask above covers READYING an aircraft, but sending it is a separate
+    /// command on the task row and had no gate: on the host AllowLaunchFunc runs
+    /// natively, and on a client FlightDeckStateApplier.SyncLaunchCommand replaces it
+    /// with an upstream AllowLaunch order. So a player who could not ready an aircraft
+    /// on somebody else's carrier could still launch one that was already ready.
+    ///
+    /// Patched at the task rather than at either UI, so both the host's local click and
+    /// the client's relayed one meet the same rule.</summary>
+    [HarmonyPatch(typeof(PendingLaunchTask), nameof(PendingLaunchTask.AllowLaunchFunc))]
+    public static class Patch_PendingLaunchTask_AllowLaunch_Ownership
+    {
+        static bool Prefix(PendingLaunchTask __instance)
+        {
+            var carrier = __instance?._flightDeck?._baseObject;
+            if (!FormationOwnership.BlocksOrdersFor(carrier)) return true;
+            OrderRefusalNotice.Note(carrier);
+            return false;
+        }
+    }
+
+    // NOT GATED: Vessel.launchNoisemaker / Submarine.launchNoisemaker.
+    //
+    // They are the torpedo-evasion states' own call as much as the player's
+    // (VesselStates.TorpedoEvasion, SubmarineStates.TorpedoEvasion), and the host
+    // simulates evasion for every ship including the ones other players command. A gate
+    // at the effect cannot tell those apart - Authority/ApplyingFromNetwork are not
+    // raised for a local AI decision - so gating it would leave teammates' ships sailing
+    // into torpedoes without decoying. The client's own manual path is refused upstream
+    // (Patch_InputHandler_NoisemakerUpstream); the host's manual key press is a residual
+    // hole, and an acceptable one: this is a coordination aid between people who chose
+    // to play together, not anti-cheat.
 }

@@ -11,20 +11,121 @@ using UnityEngine;
 
 namespace SeapowerMultiplayer
 {
-    [BepInPlugin(PluginInfo.PLUGIN_GUID, PluginInfo.PLUGIN_NAME, PluginInfo.PLUGIN_VERSION)]
-    public class Plugin : BaseUnityPlugin
+    /// <summary>
+    /// Mod runtime. Loaded by Anchor Chain (see <see cref="AnchorChainEntry"/>),
+    /// not by BepInEx directly, so this is a plain MonoBehaviour rather than a
+    /// BaseUnityPlugin - <see cref="Boot"/> does the hosting BepInEx used to do.
+    /// BepInEx itself is still present (Anchor Chain's preloader is a BepInEx
+    /// plugin), so its logging and config file remain available.
+    /// </summary>
+    public class Plugin : MonoBehaviour
     {
         internal static ManualLogSource Log = null!;
         internal static Plugin Instance = null!;
 
-        // --- Config entries (edit BepInEx/config/SeapowerMultiplayer.cfg in-game folder) ---
+        /// <summary>Set by <see cref="Boot"/> before the component is added, because
+        /// AddComponent runs Awake() synchronously and Awake() binds against it.</summary>
+        internal static ConfigFile Config = null!;
+
+        /// <summary>Marks the process as booted. AppDomain data rather than a static:
+        /// with one copy in BepInEx\plugins and another in the mod folder, each loader
+        /// loads its own copy as a separate assembly with separate statics, and a
+        /// static flag would let both boot - two mods applying every patch twice.</summary>
+        private const string BootedKey = PluginInfo.PLUGIN_GUID + ".booted";
+
+        /// <summary>
+        /// Entry point for both loaders - AnchorChainEntry and BepInExEntry. Creates the
+        /// persistent host GameObject and the logger/config that BepInEx would
+        /// otherwise provide. Whichever loader gets here first wins.
+        /// </summary>
+        internal static void Boot(bool fromAnchorChain)
+        {
+            string loader = fromAnchorChain ? "Anchor Chain" : "BepInEx";
+            Log ??= BepInEx.Logging.Logger.CreateLogSource(PluginInfo.PLUGIN_NAME);
+
+            if (AppDomain.CurrentDomain.GetData(BootedKey) is string first)
+            {
+                Log.LogWarning($"Already loaded by {first} - ignoring the {loader} copy " +
+                               $"at {typeof(Plugin).Assembly.Location}.");
+                return;
+            }
+
+            // Anchor Chain loads every DLL in every search directory without
+            // consulting the game's mod checkboxes, so unticking us in the mod
+            // menu would otherwise do nothing. Honour it ourselves. Not for a
+            // BepInEx\plugins copy: the mod menu does not list that folder, and
+            // BepInEx starts plugins before the game has built its FileManager -
+            // which Singleton.Instance would create early instead.
+            if (fromAnchorChain && !IsEnabledInModMenu())
+            {
+                Log.LogInfo("Disabled in the game's mod menu - not loading. " +
+                            "Tick \"Seapower Multiplayer\" there to enable it.");
+                return;
+            }
+            AppDomain.CurrentDomain.SetData(BootedKey, $"{loader} ({typeof(Plugin).Assembly.Location})");
+            Log.LogInfo($"Loading via {loader} from {typeof(Plugin).Assembly.Location}");
+            // GUID-named, matching what BaseUnityPlugin used to create, so existing
+            // installs keep their settings instead of silently reverting to defaults.
+            Config = new ConfigFile(
+                System.IO.Path.Combine(Paths.ConfigPath, PluginInfo.PLUGIN_GUID + ".cfg"), true);
+
+            var go = new GameObject(PluginInfo.PLUGIN_NAME);
+            UnityEngine.Object.DontDestroyOnLoad(go);
+            go.AddComponent<Plugin>();
+        }
+
+        /// <summary>
+        /// Looks up the SearchDirectory this assembly was loaded from and returns
+        /// its tick state from the game's mod menu.
+        ///
+        /// Fails open: if the directory can't be identified, load anyway. A mod
+        /// that silently refuses to start is far worse to diagnose than one that
+        /// ignores a checkbox.
+        /// </summary>
+        private static bool IsEnabledInModMenu()
+        {
+            try
+            {
+                string here = System.IO.Path.GetFullPath(
+                    System.IO.Path.GetDirectoryName(typeof(Plugin).Assembly.Location) ?? "");
+                if (here.Length == 0) return true;
+
+                foreach (var sd in Singleton<FileManager>.Instance.Directories)
+                {
+                    var di = sd?.DirectoryInfo;
+                    if (di == null) continue;
+
+                    // Anchor Chain scans recursively, so we may sit in a subfolder
+                    // of the search directory rather than its root.
+                    string root = System.IO.Path.GetFullPath(di.FullName)
+                                  .TrimEnd(System.IO.Path.DirectorySeparatorChar);
+                    if (here.Equals(root, StringComparison.OrdinalIgnoreCase) ||
+                        here.StartsWith(root + System.IO.Path.DirectorySeparatorChar,
+                                        StringComparison.OrdinalIgnoreCase))
+                        return sd.IsChecked;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning($"Could not read the mod menu state ({ex.Message}); loading anyway.");
+            }
+
+            return true;
+        }
+
+        // --- Config entries (edited in-game from the F9 overlay's SETTINGS section,
+        //     persisted to BepInEx/config/com.seapowermultiplayer.plugin.cfg) ---
         internal ConfigEntry<bool> CfgIsHost = null!;
         internal ConfigEntry<string> CfgHostIP = null!;
         internal ConfigEntry<int> CfgPort = null!;
         internal ConfigEntry<bool> CfgAutoConnect = null!;
+        internal ConfigEntry<bool> CfgLockUnits = null!;
+        internal ConfigEntry<string> CfgDefaultTeam = null!;
         internal ConfigEntry<bool> CfgPvP = null!;
+        internal ConfigEntry<string> CfgUsername = null!;
         internal ConfigEntry<string> CfgTransport = null!;
         internal ConfigEntry<bool> CfgTimeVote = null!;
+        internal ConfigEntry<bool> CfgDisableF10Menu = null!;
 
         // Debug config
         internal ConfigEntry<bool> CfgVerboseDebug = null!;
@@ -74,20 +175,40 @@ namespace SeapowerMultiplayer
         private void Awake()
         {
             Instance = this;
-            Log = Logger;
 
             // Bind config
             CfgIsHost      = Config.Bind("Network", "IsHost",       true,        "True = run as server, False = connect as client");
             CfgHostIP      = Config.Bind("Network", "HostIP",       "127.0.0.1", "Host IP address (used when IsHost=false)");
             CfgPort        = Config.Bind("Network", "Port",         7777,        "UDP port");
             CfgAutoConnect = Config.Bind("Network", "AutoConnect",  false,       "Connect/host automatically on game launch");
-            CfgPvP         = Config.Bind("Network", "PvP",          true,        "True = PvP mode (opposing taskforces); False = co-op (shared ally control)");
+            // Defaults ON. Only a fresh install is affected: Config.Bind takes the
+            // default when the key is absent from the .cfg, so anyone who has already
+            // launched once keeps whatever their file says.
+            CfgLockUnits   = Config.Bind("Network", "LockUnitsToPlayers", true,   "Host: each player owns the formations assigned to them and sees teammates' units as allies. Off = free-for-all, any teammate can order any unit.");
+            // The lock rides on every ownership packet, so a mid-session change has to
+            // push one - otherwise clients keep enforcing the old rule and one machine
+            // silently disagrees with the others about who may command what.
+            CfgLockUnits.SettingChanged += (_, __) => FormationOwnership.HostSendFull();
+            CfgDefaultTeam = Config.Bind("Network", "DefaultTeam",  "Blue",      "Team to request when joining without an invite (Blue or Red). The host decides the final seating.");
+            // Not a session mode - there is no such thing any more. It is the standing
+            // invite intent a lobby opens with, published as "pending_team" so someone
+            // who joins without a per-team invite lands opposite the host instead of
+            // beside them. Kept as a named setting because Quick Start drives versus vs
+            // co-op through it, and it is the only lobby-wide seating default there is.
+            CfgPvP         = Config.Bind("Network", "PvP",          false,       "Seat joiners who arrive without a team invite on the OPPOSITE team (versus) rather than yours (co-op).");
+            CfgUsername    = Config.Bind("Network", "Username",     "",          "Name other players see in the roster and the 'send to player' menu. Mainly for LiteNetLib, which has no identity of its own - leave empty there and you show up as \"Player 2\". On Steam this overrides your persona name if set.");
             CfgTransport   = Config.Bind("Network", "Transport",    "LiteNetLib", "Network transport: LiteNetLib (direct IP) or Steam (P2P with invites)");
             CfgTimeVote    = Config.Bind("Network", "TimeVote",     false,       "Time vote mode: both players must agree on time compression changes");
             // The client defers to the host's setting, and SessionSync only carries
             // it at join time. The overlay makes it editable mid-session, so push
             // every change - otherwise the client stays on the legacy request path.
             CfgTimeVote.SettingChanged += (_, __) => TimeSyncManager.HostBroadcastVoteMode();
+            CfgDisableF10Menu = Config.Bind("Network", "DisableF10Menu", false,
+                "Block the game's F10 debug/cheat panel. HOST DECIDES: the host's setting is sent in " +
+                "the handshake and binds the client from the moment it connects, before the session " +
+                "save reaches it. It can only ever take the panel away - a client with this on keeps " +
+                "it shut even under a host that allows it. Only ever has an effect for players who " +
+                "enabled the game's own DevMode; for everyone else F10 already does nothing.");
             CfgDisconnectTimeoutSec = Config.Bind("Network", "DisconnectTimeoutSec", 20,
                 "Seconds of silence before the link is declared dead. The stock transport defaults " +
                 "(LiteNetLib 5s, Steam 10s) drop high-latency players during ordinary stalls. " +
@@ -163,6 +284,12 @@ namespace SeapowerMultiplayer
             // shared config file so one install can run host + client instances.
             ApplyEnvOverrides();
 
+            // Workshop builds are Steam-only: there is no launcher to configure a
+            // direct-IP session and no UI to pick a transport. Forced after the env
+            // overrides so a stale cfg value can't select a transport that the mod
+            // no longer exposes.
+            CfgTransport.Value = "Steam";
+            
             // Before PatchAll, so a patch failure below is captured and uploaded.
             Analytics.Init();
 
@@ -245,16 +372,22 @@ namespace SeapowerMultiplayer
             string? role      = V("SPMP_ROLE");
             string? hostIp    = V("SPMP_HOSTIP");
             string? port      = V("SPMP_PORT");
-            string? pvp       = V("SPMP_PVP");
+            // SPMP_TEAM replaces SPMP_PVP: the two-instance test harness now says which
+            // SIDE the second instance plays, not what mode the session is in.
+            string? team      = V("SPMP_TEAM");
+            // The whole point of a name override is telling two instances on ONE
+            // machine apart, so it has to be settable per-process, not just in the
+            // config file both of them share.
+            string? username  = V("SPMP_USERNAME");
             string? autoConn  = V("SPMP_AUTOCONNECT");
             string? transport = V("SPMP_TRANSPORT");
             string? simLoss   = V("SPMP_NETSIM_LOSS");
             string? simLat    = V("SPMP_NETSIM_LATMS");
             string? simJitter = V("SPMP_NETSIM_JITTERMS");
 
-            if (role == null && hostIp == null && port == null && pvp == null
-                && autoConn == null && transport == null && simLoss == null && simLat == null
-                && simJitter == null)
+            if (role == null && hostIp == null && port == null && team == null
+                && username == null && autoConn == null && transport == null && simLoss == null
+                && simLat == null && simJitter == null)
                 return;
 
             Config.SaveOnConfigSet = false; // keep dev overrides out of the shared cfg
@@ -262,7 +395,8 @@ namespace SeapowerMultiplayer
             if (role != null)      CfgIsHost.Value      = role.Equals("host", StringComparison.OrdinalIgnoreCase);
             if (hostIp != null)    CfgHostIP.Value      = hostIp;
             if (port != null && int.TryParse(port, out int p))            CfgPort.Value = p;
-            if (pvp != null)       CfgPvP.Value         = pvp == "1" || pvp.Equals("true", StringComparison.OrdinalIgnoreCase);
+            if (team != null)      CfgDefaultTeam.Value = team.Equals("red", StringComparison.OrdinalIgnoreCase) ? "Red" : "Blue";
+            if (username != null)  CfgUsername.Value    = username;
             if (autoConn != null)  CfgAutoConnect.Value = autoConn == "1" || autoConn.Equals("true", StringComparison.OrdinalIgnoreCase);
             if (transport != null) CfgTransport.Value   = transport;
             if (simLoss != null && float.TryParse(simLoss, out float l)) CfgNetSimLossPct.Value = l;
@@ -270,7 +404,8 @@ namespace SeapowerMultiplayer
             if (simJitter != null && int.TryParse(simJitter, out int j)) CfgNetSimJitterMs.Value = j;
 
             Log.LogWarning($"[Config] SPMP_* env overrides active (role={(CfgIsHost.Value ? "host" : "client")}, " +
-                $"ip={CfgHostIP.Value}, port={CfgPort.Value}, pvp={CfgPvP.Value}, autoConnect={CfgAutoConnect.Value}, " +
+                $"ip={CfgHostIP.Value}, port={CfgPort.Value}, team={CfgDefaultTeam.Value}, user={CfgUsername.Value}, " +
+                $"autoConnect={CfgAutoConnect.Value}, " +
                 $"transport={CfgTransport.Value}, simLoss={CfgNetSimLossPct.Value}%, " +
                 $"simLat={CfgNetSimLatencyMs.Value}ms, simJitter=±{CfgNetSimJitterMs.Value}ms). " +
                 "Config persistence disabled for this run.");
@@ -383,7 +518,15 @@ namespace SeapowerMultiplayer
             WeaponHatchHandler.Tick();
             Suppression.EnforceDefenseFlag();
             Suppression.EnforceInterceptSymmetry();
-            UnitLockManager.SampleInput();
+            DebugMenuLock.Tick();
+            // Collect ownerless flight-deck reservations behind a stalled launch, so a
+            // vanilla deck jam does not end that carrier's air ops for the mission.
+            FlightDeckJamGuard.Tick();
+            // Standing Orders: the sim reads them on the host, so every team's edits go there.
+            DoctrineSyncManager.Tick();
+            // UnitLockManager's transient selection lock is gone; its refusal-notice
+            // half lives on here under its own name.
+            OrderRefusalNotice.SampleInput();
 
             // Ctrl+F11 motion trace. Last of the per-frame hooks so the FRAME row
             // records the transform the replica drivers actually left behind.

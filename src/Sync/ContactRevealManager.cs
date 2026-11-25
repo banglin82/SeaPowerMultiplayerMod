@@ -23,19 +23,18 @@ namespace SeapowerMultiplayer
     /// uncertainty from the game. A contact is only revealed while the local side
     /// has no track of its own for it; the moment local sensors acquire it
     /// (<c>Vehicle.DetectingSensors</c> stops reading Unknown) refreshing stops and
-    /// the local, uncertain fix takes over. So the two players see the same SET of
-    /// contacts, and each player's own sensors still decide how well they see them.
+    /// the local, uncertain fix takes over. So teammates see the same SET of contacts,
+    /// and each player's own sensors still decide how well they see them.
     ///
-    /// CO-OP ONLY, like the rest of the shared picture: in PvP the two pictures are
-    /// meant to differ and sharing one would hand over intel the other side has not
-    /// earned.
+    /// TEAM-scoped, like the rest of the shared picture: opponents' pictures are meant
+    /// to differ and sharing one would hand over intel the other side has not earned.
     /// </summary>
     public static class ContactRevealManager
     {
-        /// <summary>Object ids the REMOTE machine holds a contact for. The host
-        /// learns these from ContactReportMessage; the client already has them as
-        /// the keys of the host's override table.</summary>
+        /// <summary>CLIENT: object ids the host holds, from its override table.</summary>
         private static readonly HashSet<int> _remoteHeld = new(128);
+        private static readonly Dictionary<byte, (Team team, HashSet<int> ids)> _remoteHeldBySlot = new();
+        private static readonly HashSet<int> _teamHeld = new(128);
 
         private static readonly ContactReportMessage _report = new();
 
@@ -58,21 +57,28 @@ namespace SeapowerMultiplayer
         public static void Reset()
         {
             _remoteHeld.Clear();
+            _remoteHeldBySlot.Clear();
+            _teamHeld.Clear();
             _report.Reset();
         }
 
         // ── Inbound ───────────────────────────────────────────────────────────
 
         /// <summary>HOST: the client's contact list has arrived.</summary>
-        public static void ApplyReceived(ContactReportMessage msg)
+        public static void ApplyReceived(byte slot, ContactReportMessage msg)
         {
             if (!Plugin.Instance.CfgIsHost.Value) return;
-            if (!ContactSyncManager.CoopSessionActive) return;
+            if (!PlayerRegistry.TryGet(slot, out var player) || !ContactSyncManager.TeamShares(player.Team)) return;
 
-            _remoteHeld.Clear();
+            if (!_remoteHeldBySlot.TryGetValue(slot, out var held))
+                held = (player.Team, new HashSet<int>(128));
+            held.ids.Clear();
             for (int i = 0; i < msg.UniqueIds.Count; i++)
-                _remoteHeld.Add(msg.UniqueIds[i]);
+                held.ids.Add(msg.UniqueIds[i]);
+            _remoteHeldBySlot[slot] = (player.Team, held.ids);
         }
+
+        internal static void ForgetSlot(byte slot) => _remoteHeldBySlot.Remove(slot);
 
         /// <summary>CLIENT: the host's picture is its contact list - no extra
         /// message needed, the override table already carries exactly the ids the
@@ -117,19 +123,42 @@ namespace SeapowerMultiplayer
         /// </summary>
         public static void Tick()
         {
-            if (!ContactSyncManager.CoopSessionActive) return;
-            if (_remoteHeld.Count == 0) return;
+            if (!Plugin.Instance.CfgIsHost.Value)
+            {
+                if (!ContactSyncManager.TeamSessionActive || _remoteHeld.Count == 0) return;
+                var local = Globals._playerTaskforce;
+                if (local != null) RevealInto(local, _remoteHeld);
+                return;
+            }
 
-            var table = Globals._playerTaskforce?.PlottingTable;
+            if (!ContactSyncManager.HostAnyTeamShares) return;
+            foreach (var team in SideTable.All)
+            {
+                if (!ContactSyncManager.TeamShares(team)) continue;
+                var tf = Teams.TaskforceFor(team);
+                if (tf?.PlottingTable == null) continue;
+
+                _teamHeld.Clear();
+                foreach (var entry in _remoteHeldBySlot)
+                    if (entry.Value.team == team
+                        && PlayerRegistry.TryGet(entry.Key, out var player) && player.Team == team)
+                        _teamHeld.UnionWith(entry.Value.ids);
+                if (_teamHeld.Count > 0) RevealInto(tf, _teamHeld);
+            }
+        }
+
+        private static void RevealInto(Taskforce tf, IEnumerable<int> ids)
+        {
+            var table = tf.PlottingTable;
             if (table == null) return;
 
             ObjectBase? detector = null;
 
-            foreach (int id in _remoteHeld)
+            foreach (int id in ids)
             {
                 var obj = StateSerializer.FindById(id);
                 if (obj == null || obj.IsDestroyed || !obj.isUnit()) continue;
-                if (obj._taskforce == Globals._playerTaskforce) continue;
+                if (obj._taskforce == tf) continue;
 
                 // Our own sensors are on it - let the local fix stand, errors and
                 // all, and stop propping the track up. A contact we are only
@@ -142,7 +171,7 @@ namespace SeapowerMultiplayer
                     && vehicle.DetectingSensors != SensorSystem.SensorTypeSet.Unknown)
                     continue;
 
-                detector ??= FindDetector();
+                detector ??= FindDetector(tf);
                 if (detector == null) return; // no live unit of ours to attribute it to
 
                 try
@@ -174,7 +203,7 @@ namespace SeapowerMultiplayer
         /// <summary>Any live unit of ours can carry the report. RevealContactToObject
         /// derives bearing and range from it, but writes the contact's true position
         /// either way, so the choice does not change where the contact appears.</summary>
-        private static ObjectBase? FindDetector()
+        private static ObjectBase? FindDetector(Taskforce tf)
         {
             var all = UnitRegistry.All;
             for (int i = 0; i < all.Count; i++)
@@ -182,7 +211,7 @@ namespace SeapowerMultiplayer
                 var u = all[i];
                 if (u == null || u.IsDestroyed) continue;
                 if (!u.isUnit()) continue;
-                if (u._taskforce != Globals._playerTaskforce) continue;
+                if (u._taskforce != tf) continue;
                 if (u.PlottingTable == null) continue;
                 return u;
             }

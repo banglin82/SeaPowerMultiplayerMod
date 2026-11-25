@@ -32,9 +32,12 @@ namespace SeapowerMultiplayer.Messages
         public int    TargetId;          // intended target UniqueID (0 = bearing/position shot)
         public double AimLonDeg, AimLatDeg;
         public float  AimHeightM;
-        public byte   Flags;             // bit0 = isSubmunition
+        public byte   Flags;             // bit0 = isSubmunition, bit1 = on a guidance wire
 
         public const byte FlagSubmunition = 1;
+        /// <summary>The round left the launcher on a guidance wire. The client's own
+        /// launch of the replica has no weapon system, so it cannot work this out.</summary>
+        public const byte FlagOnWire      = 2;
 
         // ── Unit payload (aircraft / helicopter) ──────────────────────────────
         public byte   UnitKind;          // UnitType.Aircraft / UnitType.Helicopter
@@ -43,7 +46,7 @@ namespace SeapowerMultiplayer.Messages
         public string LoadoutVariant = "";
         public byte   UnitNumber;
         public int    HomeBaseId;        // carrier/airbase UniqueID (0 = none)
-        public byte   TaskforceSide;     // Taskforce.TfType - fallback when home base unresolvable
+        public string TaskforceName = ""; // side's stable mission name - fallback when home base unresolvable
         public string Nation = "";
         public byte   UnitFlags;         // bit0 = deck phase (on the carrier, DeckState-driven)
 
@@ -85,7 +88,7 @@ namespace SeapowerMultiplayer.Messages
                 writer.Put(LoadoutVariant);
                 writer.Put(UnitNumber);
                 writer.Put(HomeBaseId);
-                writer.Put(TaskforceSide);
+                writer.Put(TaskforceName ?? "");
                 writer.Put(Nation);
                 writer.Put(UnitFlags);
                 writer.Put(UnitName);
@@ -126,7 +129,7 @@ namespace SeapowerMultiplayer.Messages
                 msg.LoadoutVariant = reader.GetString();
                 msg.UnitNumber     = reader.GetByte();
                 msg.HomeBaseId     = reader.GetInt();
-                msg.TaskforceSide  = reader.GetByte();
+                msg.TaskforceName  = reader.GetString();
                 msg.Nation         = reader.GetString();
                 msg.UnitFlags      = reader.GetByte();
                 msg.UnitName       = reader.GetString();

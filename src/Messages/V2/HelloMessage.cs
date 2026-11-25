@@ -10,19 +10,28 @@ namespace SeapowerMultiplayer.Messages
     {
         public ushort ProtocolVersion;
         public string PluginVersion = "";
-        public bool   IsPvP;
+        /// <summary>Which side the joiner is asking for (a SideTable index). A REQUEST, not a
+        /// decision: it comes from the lobby's pending-invite key, which two people
+        /// accepting the same invite would both read. The host seats them.
+        /// Occupies the wire slot the old session-wide IsPvP flag had.</summary>
+        public byte   RequestedTeam;
         /// <summary>Sea Power build the client is running (added in protocol 221).</summary>
         public string GameVersion = "";
-        /// <summary>The sender's Options → Gameplay settings, packed - see
-        /// <see cref="RemoteGameplayOptions"/>. Here rather than in a stream because
-        /// they are per-machine facts about the PLAYER, which is exactly what the
-        /// handshake is for.</summary>
+        /// <summary>Reserved, always 0. Carried the sender's packed Options → Gameplay
+        /// winchester/auto-attack settings until the game moved them into Standing
+        /// Orders, which DoctrineSyncManager now keeps in step. Kept so the layout of
+        /// the fields after it does not move.</summary>
         public byte GameplayOptions;
         /// <summary>Fingerprint and size of the sender's enabled mod set - see
         /// <see cref="ModSetCheck"/>. A hash rather than the names because the handshake
         /// must stay under the MTU floor.</summary>
         public uint ModFingerprint;
         public byte ModCount;
+        /// <summary>Steam persona name, so the host can seat the player under a name the
+        /// other players will recognise in the roster and the "send to player" menu.
+        /// Empty on LiteNetLib, which has no identity concept - those players show as
+        /// their slot number instead.</summary>
+        public string DisplayName = "";
 
         public MessageType Type => MessageType.Hello;
 
@@ -30,11 +39,12 @@ namespace SeapowerMultiplayer.Messages
         {
             writer.Put(ProtocolVersion);
             writer.Put(PluginVersion);
-            writer.Put(IsPvP);
+            writer.Put(RequestedTeam);
             writer.Put(GameVersion);
             writer.Put(GameplayOptions);
             writer.Put(ModFingerprint);
             writer.Put(ModCount);
+            writer.Put(DisplayName ?? "");
         }
 
         // GameVersion is read only if the sender actually wrote it: a pre-221 client
@@ -44,13 +54,14 @@ namespace SeapowerMultiplayer.Messages
         {
             ProtocolVersion = reader.GetUShort(),
             PluginVersion   = reader.GetString(),
-            IsPvP           = reader.GetBool(),
+            RequestedTeam   = reader.GetByte(),
             GameVersion     = reader.AvailableBytes > 0 ? reader.GetString() : "",
             // Same tolerance as GameVersion above, for the same reason: an older
             // client has to parse cleanly enough to be TOLD its protocol is wrong.
             GameplayOptions = reader.AvailableBytes > 0 ? reader.GetByte() : (byte)0,
             ModFingerprint  = reader.AvailableBytes >= 4 ? reader.GetUInt() : 0u,
             ModCount        = reader.AvailableBytes > 0 ? reader.GetByte() : (byte)0,
+            DisplayName     = reader.AvailableBytes > 0 ? reader.GetString() : "",
         };
     }
 }

@@ -162,11 +162,11 @@ namespace SeapowerMultiplayer
         private static void SpawnUnitReplica(EntitySpawnMessage msg)
         {
             var homeBase = StateSerializer.FindById(msg.HomeBaseId);
-            Taskforce? tf = homeBase?._taskforce ?? ResolveTaskforce(msg.TaskforceSide);
+            Taskforce? tf = homeBase?._taskforce ?? ResolveTaskforce(msg.TaskforceName);
             if (tf == null)
             {
                 Telemetry.Count("v2.unitSpawnNoTaskforce");
-                Plugin.Log.LogError($"[SpawnReplicator] Unit spawn {msg.EntityId}: no taskforce (side={msg.TaskforceSide})");
+                Plugin.Log.LogError($"[SpawnReplicator] Unit spawn {msg.EntityId}: no taskforce (side={msg.TaskforceName})");
                 return;
             }
 
@@ -212,6 +212,7 @@ namespace SeapowerMultiplayer
                 // the deck-relative DeckState stream.
                 result._correctAltitudeOnSpawn = false;
                 DeckPuppetDriver.RegisterDeckSpawn(result, homeBase!);
+                LaunchWeaponState.StampOwnDeckReplica(result, homeBase!);
             }
             else
             {
@@ -298,14 +299,20 @@ namespace SeapowerMultiplayer
                 // consumed here, staying 1:1 with the host's launches).
                 var sys = FindChaffSystem(shooter, msg.AmmoName);
                 var attacher = sys != null && _chaffRef != null ? _chaffRef(sys) : null;
-                var clouds = attacher != null && _chaffCloudsRef != null ? _chaffCloudsRef(attacher) : null;
-                if (clouds == null || clouds.Count == 0) { Telemetry.Count("v2.decoyNoAttacher"); return; }
+                if (attacher == null) { Telemetry.Count("v2.decoyNoAttacher"); return; }
 
-                var cloud = clouds[0];
-                if (cloud.isLaunched()) { Telemetry.Count("v2.decoyAttacherStuck"); return; }
-
+                // Since 0.9 the attacher no longer pre-pools a list of clouds: it keeps a
+                // count of pending rounds and creates each cloud from the pool at launch.
+                // The host fired one, so make sure the local count can cover it (reload
+                // bookkeeping is suppressed client-side), then pick the new cloud up from
+                // the launchChaffEffect postfix - launchChaffCloud does not return it.
+                if (attacher.PendingRounds <= 0) attacher.AddChaffAmmo(1);
+                Patch_V2_ChaffLaunch_Capture.LastLaunched = null;
                 using (Authority.Allowed())
-                    attacher!.launchChaffCloud(); // launchChaffEffect + taskforce registration + SetActive
+                    attacher.launchChaffCloud(); // launchChaffEffect + taskforce registration + SetActive
+                var cloud = Patch_V2_ChaffLaunch_Capture.LastLaunched;
+                Patch_V2_ChaffLaunch_Capture.LastLaunched = null;
+                if (cloud == null) { Telemetry.Count("v2.decoyAttacherStuck"); return; }
 
                 // The host's launchChaff() decremented its loaded count before
                 // launching the cloud; mirror that here or the client's chaff
@@ -322,8 +329,6 @@ namespace SeapowerMultiplayer
 
         private static readonly AccessTools.FieldRef<WeaponSystemChaff, ChaffAttacher>? _chaffRef =
             AccessTools.FieldRefAccess<WeaponSystemChaff, ChaffAttacher>("_chaff");
-        private static readonly AccessTools.FieldRef<ChaffAttacher, List<ChaffCloud>>? _chaffCloudsRef =
-            AccessTools.FieldRefAccess<ChaffAttacher, List<ChaffCloud>>("_chaffClouds");
 
         private static WeaponSystemChaff? FindChaffSystem(ObjectBase shooter, string ammoName)
         {
@@ -381,71 +386,25 @@ namespace SeapowerMultiplayer
         }
 
         /// <summary>Which local taskforce a replicated spawn belongs to, given the side
-        /// byte the HOST stamped on it.
+        /// name the HOST stamped on it.
         ///
-        /// TWO BUGS LIVED IN THE OLD ONE-LINE VERSION, which matched the enum by name
-        /// against TaskforceManager's list.
-        ///
-        /// (1) The byte is the side as the HOST sees it, and PvP hands the guest a save
-        /// with PlayerTaskforce and EnemyTaskforce swapped
-        /// (SessionManager.SwapTaskforceSides). Matching Player to Player therefore gave
-        /// a host-owned aircraft to the guest's OWN taskforce: it rendered friendly,
-        /// could not be controlled (it is still a replica), and every missile it fired
-        /// inherited the same wrong side, because SpawnWeaponReplica copies
-        /// objectBase._taskforce straight across. Playtest 28 reported both halves. The
-        /// fallback is reached whenever HomeBaseId is 0 or its object has no local
+        /// By the side's stable mission name, never its role: a reseated guest's save
+        /// has a different PlayerTaskforce, so every role differs on its machine, and
+        /// matching Player to Player once gave a host-owned aircraft to the guest's OWN
+        /// taskforce (Playtest 28) - and every missile it fired inherited the same wrong
+        /// side, because SpawnWeaponReplica copies objectBase._taskforce straight across.
+        /// The fallback is reached whenever HomeBaseId is 0 or its object has no local
         /// replica yet, so it is not a rare path.
         ///
-        /// (2) TaskforceManager reparents itself to Globals._missionSingletonsParent in
-        /// Awake exactly as ObjectsManager does, but MissionManager's unload hand-destroys
-        /// only ObjectsManager - so Singleton's static _instance survives the mission,
-        /// _taskForces has no Clear anywhere in the assembly, and SceneCreator APPENDS
-        /// the next mission's taskforces to it. The first match for a side, after a
-        /// second battle in one lobby, is a DEAD taskforce from the first one.
-        ///
-        /// Resolving against Globals closes both: those three fields are rebuilt per
-        /// mission, so they cannot be stale, and the PvP inversion is applied explicitly
-        /// instead of being implied by a name. Done here rather than by sending
-        /// "mine/theirs" on the wire because the receiver is the only side that knows
-        /// whether its own save was swapped - and it costs no protocol change.</summary>
-        private static Taskforce? ResolveTaskforce(byte hostSide)
+        /// Searched newest-first: TaskforceManager's _taskForces has been seen to
+        /// survive a mission unload and have the next mission's sides APPENDED, so the
+        /// first match after a second battle in one lobby could be a dead taskforce.</summary>
+        private static Taskforce? ResolveTaskforce(string name)
         {
-            var side = (Taskforce.TfType)hostSide;
-
-            // Only the guest's save is rewritten, and only in PvP. The host's own view
-            // is never swapped, so its side byte means exactly what it says there.
-            bool swapped = Plugin.Instance.CfgPvP.Value && !Plugin.Instance.CfgIsHost.Value;
-
-            switch (side)
-            {
-                case Taskforce.TfType.Player:
-                    return swapped ? Globals._enemyTaskforce : Globals._playerTaskforce;
-
-                case Taskforce.TfType.Enemy:
-                    return swapped ? Globals._playerTaskforce : Globals._enemyTaskforce;
-
-                case Taskforce.TfType.Neutral:
-                    return Globals._neutralTaskforce;
-
-                default:
-                    // Ally (and None) have no Globals anchor, so these still take the
-                    // scan and still carry bug (2)'s stale risk. Left rather than
-                    // guessed at: a mission with a separate Ally taskforce spawning
-                    // replicated units through this fallback is the only way to reach
-                    // it, and inventing an anchor for it would be worse than the scan.
-                    return ScanTaskforcesForSide(side);
-            }
-        }
-
-        /// <summary>Last resort - see ResolveTaskforce's default branch for why this is
-        /// still here and what it can get wrong.</summary>
-        private static Taskforce? ScanTaskforcesForSide(Taskforce.TfType side)
-        {
-            if (!Singleton<TaskforceManager>.InstanceExists(false)) return null;
-            foreach (var tf in Singleton<TaskforceManager>.Instance._taskForces)
-            {
-                if (tf != null && tf.Side == side) return tf;
-            }
+            if (string.IsNullOrEmpty(name) || !Singleton<TaskforceManager>.InstanceExists(false)) return null;
+            var all = Singleton<TaskforceManager>.Instance._taskForces;
+            for (int i = all.Count - 1; i >= 0; i--)
+                if (all[i] != null && all[i]._nameInMissionFile == name) return all[i];
             return null;
         }
 
@@ -472,6 +431,12 @@ namespace SeapowerMultiplayer
 
             // DevModeUtils.createAmmunitionObjectInstance recipe
             wb.init(shooter, Vector3.zero, ap);
+            // Weapon failures are rolled once per round, on first launch / first seeker
+            // activation (SeekerBase.setActive), and init() has just re-armed both rolls.
+            // The host already rolled them for the real round; a second roll here could
+            // only invent a malfunction alert and a lost connection the host never had.
+            wb._launchCheckDone = true;
+            wb._seekerCheckDone = true;
             wb.setSensorData(wb.getWeaponInstance()._sensorData);
             wb.setName(ap._displayedName);
             wb.setObjectIniName(ap._ammunitionFileName);
@@ -516,6 +481,17 @@ namespace SeapowerMultiplayer
                     // Real initializer: _launchTime, parent detach, _proximityRadius,
                     // taskforce/plotting registration, target._incomingWeapons (threat UI)
                     wb.CommonLaunchSettings(target, aimUnity, null, isSub);
+
+                    // The wire is decided against the launching weapon system, which this
+                    // launch does not have, so CommonLaunchSettings left the replica off the
+                    // wire and flagged it ConnectionLostForever - and the weapon panel then
+                    // offered none of the wire commands. Take the host's answer instead.
+                    if ((msg.Flags & EntitySpawnMessage.FlagOnWire) != 0)
+                    {
+                        wb._onWire = true;
+                        wb.ConnectionLost.Value = false;
+                        wb.ConnectionLostForever.Value = false;
+                    }
                 }
             }
 
@@ -729,6 +705,14 @@ namespace SeapowerMultiplayer
                                           $"({wb.GetType().Name}): {ex.Message}");
                 }
             }
+            else if (obj != null && msg.Cause == DespawnCause.Departed)
+            {
+                // The game's own departure: recovers what is aboard, detaches the
+                // formation and leaves the area exactly as the host's copy did.
+                using (Authority.Allowed())
+                    obj.despawnObject();
+                AircraftReplicaDriver.Forget(msg.EntityId);
+            }
             else if (obj is Aircraft || obj is Helicopter)
             {
                 // Landed/stored/scripted removal - quiet local removal, no VFX
@@ -781,9 +765,9 @@ namespace SeapowerMultiplayer
                 return;
             }
 
-            ScanForCorpses(Globals._playerTaskforce);
-            ScanForCorpses(Globals._enemyTaskforce);
-            ScanForCorpses(Globals._neutralTaskforce);
+            if (!Singleton<TaskforceManager>.InstanceExists(false)) return;
+            foreach (var tf in Singleton<TaskforceManager>.Instance._taskForces)
+                ScanForCorpses(tf);
         }
 
         private static void ScanForCorpses(Taskforce? tf)

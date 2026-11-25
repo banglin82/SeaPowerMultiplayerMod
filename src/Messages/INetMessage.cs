@@ -38,6 +38,14 @@ namespace SeapowerMultiplayer.Messages
         ContactReport            = 34,  // client → host: object ids the client's plotting table holds (the other half of ContactSync)
         UnitStatus               = 35,  // host → client: bottom-row status line + per-mount engagement state
         JamState                 = 36,  // host → client: offensive ECM jam assignments (who is jamming what)
+        PlayerRoster             = 37,  // host → clients: who is in the session, their team and slot
+        UnitOwnership            = 38,  // host → clients: which player commands which units
+        WeaponWireState          = 39,  // host → client: wire-guided torpedo state (aim point, target, wire status)
+        DoctrineSync             = 40,  // bidirectional: Standing Orders (TacticalDoctrine) root/formation/unit values
+        SideTable                = 41,  // host → clients: the mission's seatable sides (what a team byte indexes)
+        SideRelation             = 42,  // host → clients: a side pair's relationship changed during play
+        TriggerFired             = 43,  // host → clients: a mission trigger fired (client plays its presentation)
+        TriggerRequest           = 44,  // client → host: the player chose a trigger to fire (free-content window)
     }
 
     public interface INetMessage

@@ -16,7 +16,7 @@ namespace SeapowerMultiplayer
     /// force: mismatched track numbers, and contacts identified on one screen and
     /// unknown on the other.
     ///
-    /// The host captures its picture here and the client overlays it onto its own
+    /// The host captures each team's picture here and its clients overlay it onto their own
     /// (<see cref="Patch_Vehicle_UpdateFromECS_ContactSync"/>). The overlay is
     /// ADDITIVE, never subtractive: the host's track number always wins (that is
     /// the whole point - one shared number), but side and class are only applied
@@ -39,14 +39,14 @@ namespace SeapowerMultiplayer
         internal readonly struct Override
         {
             public readonly int     TrackId;
-            public readonly bool    Classified; // host knows whose it is
+            public readonly byte    Side;       // ContactSyncMessage.Side* - what the host resolved
             public readonly object? BoxedClass; // null = host has not identified it
             public readonly byte    Compliance; // host's AI.Compliance roll, 0 = none yet
 
-            public Override(int trackId, bool classified, object? boxedClass, byte compliance)
+            public Override(int trackId, byte side, object? boxedClass, byte compliance)
             {
                 TrackId    = trackId;
-                Classified = classified;
+                Side       = side;
                 BoxedClass = boxedClass;
                 Compliance = compliance;
             }
@@ -63,10 +63,12 @@ namespace SeapowerMultiplayer
         // ── Client track-number collision guard ───────────────────────────────
 
         /// <summary>Where the client parks track numbers for foreign contacts the
-        /// host has not numbered yet. Comfortably above the game's own foreign
-        /// range (PlottingTable._maxForeignTrackId starts at 7001), so a number the
-        /// client invents can never equal one the host issues.</summary>
-        private const int PrivateTrackBase = 20001;
+        /// host has not numbered yet. Inside the game's foreign series - the plotting
+        /// table now renumbers any foreign track whose number does not start with 7
+        /// (PlottingTable.RefreshTrackNumber, on every update) - but in a block it only
+        /// widens into after exhausting 7001-7999, 70001-79999 and 700001-799999, so
+        /// a number the client invents can never equal one the host issues.</summary>
+        private const int PrivateTrackBase = 7_000_001;
 
         private static readonly Dictionary<int, int> _privateTrackIds = new(32);
         private static int _nextPrivateTrackId = PrivateTrackBase;
@@ -158,7 +160,7 @@ namespace SeapowerMultiplayer
         private static Type?      _sourcedSideType;
         private static bool       _sideReflectionResolved;
 
-        /// <summary>One boxed SourcedProperty per taskforce. There are two, and
+        /// <summary>One boxed SourcedProperty per taskforce. There is a handful, and
         /// SetValue copies the struct in, so the boxes are safe to share.</summary>
         private static readonly Dictionary<Taskforce, object> _boxedSides = new(2);
 
@@ -186,13 +188,23 @@ namespace SeapowerMultiplayer
             return true;
         }
 
-        /// <summary>Client: give a contact a Side when the host has classified it
-        /// and the client's own sensors have not. Additive like the rest of the
-        /// overlay - a Side the client resolved itself is never overwritten.</summary>
-        internal static bool ApplySideIfMissing(Vehicle vehicle, Taskforce side)
+        /// <summary>Client: write the side the host resolved onto a contact.
+        ///
+        /// Only called when the host actually has an answer, so this never erases a
+        /// side the client worked out and the host has not - the caller's
+        /// SideUnknown check is what keeps the overlay additive.
+        ///
+        /// It DOES overwrite a side the client resolved differently, and it has to.
+        /// Side is a sticky field: UpdateFromECS only assigns it inside a
+        /// HasComponent&lt;DetectedSide&gt; guard and never clears it, then ends with
+        /// <c>UnitTaskforce.Value = Side.Value</c>. Leaving a stale disagreeing Side
+        /// in place meant the game re-derived the old taskforce from it on every
+        /// tick and the postfix put ours back - two ReactiveProperty transitions per
+        /// tick, and Taskforce.AddVehcleListeners raises a "track classified" alert
+        /// and voice line off each one.</summary>
+        internal static bool ApplySide(Vehicle vehicle, Taskforce side)
         {
             if (side == null || !ResolveSideReflection()) return false;
-            if (_sideField!.GetValue(vehicle) != null) return false; // client already knows
 
             if (!_boxedSides.TryGetValue(side, out var boxed))
             {
@@ -200,9 +212,77 @@ namespace SeapowerMultiplayer
                 _sourcedSideValueField!.SetValue(boxed, side);
                 _boxedSides[side] = boxed;
             }
-            _sideField.SetValue(vehicle, boxed);
+            _sideField!.SetValue(vehicle, boxed);
             return true;
         }
+
+        /// <summary>The spy units the player's task force has seen through for
+        /// itself. The game keys the disguise off this list, and it is per-machine:
+        /// nothing puts it in the save or on the wire.</summary>
+        private static List<ObjectBase>? IdentifiedSpyUnits
+            => Globals._playerTaskforce?._identifiedSpyUnits;
+
+        private static bool IsDisguisedSpy(ObjectBase obj)
+        {
+            var p = obj._obp;
+            return p != null
+                && !string.IsNullOrEmpty(p._disguisedAs)
+                && p._unitRoles != null
+                && p._unitRoles.Contains(ObjectBaseParameters.UnitRoles.Spy);
+        }
+
+        /// <summary>Client: the taskforce the host's side code names, or null when
+        /// the host has no answer and the local picture should stand.</summary>
+        internal static Taskforce? ResolveSide(in Override ov, ObjectBase obj)
+        {
+            if (ov.Side == ContactSyncMessage.SideActual) return obj._taskforce;
+            if (ov.Side != ContactSyncMessage.SideCover)  return null;
+
+            // Additive, like the rest of the overlay: if OUR sensors have already
+            // seen through the disguise the host is still looking at, keep the real
+            // side rather than pushing the contact back to its cover identity - and
+            // rather than starting the same tick-by-tick fight in the other
+            // direction, since the local pipeline would keep writing the real side
+            // straight back.
+            if (IdentifiedSpyUnits?.Contains(obj) == true) return null;
+            return Globals._neutralTaskforce;
+        }
+
+        /// <summary>
+        /// CLIENT: share the host's unmasking of a disguised spy unit.
+        ///
+        /// A spy vessel with <c>_disguisedAs</c> set is reported to its detector's
+        /// task force as NEUTRAL until a sensor gets inside truth distance, at which
+        /// point SensorUtils.CheckClassificationOrIdentification adds it to that
+        /// task force's <c>_identifiedSpyUnits</c> and every later track carries its
+        /// real side instead. That list is per-machine, so the host unmasking a spy
+        /// left the client's own ESM, visual and sonar still writing
+        /// DetectedSide(neutral) for it - forever fighting the side this overlay
+        /// writes, one map alert and voice line per 3 s batch window.
+        ///
+        /// Adding the object to the client's list makes the client's own sensor
+        /// pipeline agree, so the fight stops at its source rather than being papered
+        /// over. Re-checked per tick because Taskforce.OnUpdate prunes the list of
+        /// anything it currently has no map vehicle for.
+        /// </summary>
+        internal static void SyncSpyUnmasking(ObjectBase obj, byte sideCode)
+        {
+            if (sideCode != ContactSyncMessage.SideActual) return;
+            if (!IsDisguisedSpy(obj)) return;
+
+            var identified = IdentifiedSpyUnits;
+            if (identified == null || identified.Contains(obj)) return;
+
+            identified.Add(obj);
+
+            // Once per contact per session: the prune above means we re-add this
+            // one whenever its map vehicle blinks, and that is not news.
+            if (_loggedUnmaskings.Add(obj.UniqueID))
+                Plugin.Log.LogInfo($"[Contacts] Host has seen through spy unit {obj.name} " +
+                    $"(id={obj.UniqueID}) - sharing it with our own sensors");
+        }
+
+        private static readonly HashSet<int> _loggedUnmaskings = new(8);
 
         /// <summary>Host side of the same problem: reading Vehicle.Class in source
         /// would name SourcedProperty&lt;string&gt; and pull the reference in just
@@ -215,18 +295,31 @@ namespace SeapowerMultiplayer
             return _sourcedValueField!.GetValue(boxed) as string ?? "";
         }
 
+        /// <summary>Host: which of the three answers our picture gives for this
+        /// contact. The game only ever resolves a side to the contact's own task
+        /// force or - for a spy unit still wearing its cover - to the neutral one,
+        /// so "anything but its own" and "cover" are the same case, and folding
+        /// them together puts the client on the same neutral reading we are looking
+        /// at.</summary>
+        private static byte SideCodeFor(Vehicle vehicle, ObjectBase obj)
+        {
+            var tf = vehicle.UnitTaskforce.Value;
+            if (tf == null) return ContactSyncMessage.SideUnknown;
+            return tf == obj._taskforce ? ContactSyncMessage.SideActual : ContactSyncMessage.SideCover;
+        }
+
         /// <summary>Client: fold a host packet into the override table.</summary>
         public static void ApplyReceived(ContactSyncMessage msg)
         {
             if (Plugin.Instance.CfgIsHost.Value) return;
-            if (Plugin.Instance.CfgPvP.Value) return; // co-op only - see CoopSessionActive
+            if (!Teams.HasTeammates) return; // see TeamSessionActive
 
             if (msg.IsFull) _overrides.Clear();
 
             for (int i = 0; i < msg.Entries.Count; i++)
             {
                 var e = msg.Entries[i];
-                _overrides[e.UniqueId] = new Override(e.TrackId, e.Classified, BoxClass(e.ClassName), e.Compliance);
+                _overrides[e.UniqueId] = new Override(e.TrackId, e.Side, BoxClass(e.ClassName), e.Compliance);
             }
 
             // The override keys ARE the host's contact list, so the reveal sweep
@@ -237,8 +330,9 @@ namespace SeapowerMultiplayer
         public static void Reset()
         {
             _overrides.Clear();
-            _lastSent.Clear();
+            _lastSentByTeam.Clear();
             _boxedSides.Clear(); // taskforce objects do not survive a scene change
+            _loggedUnmaskings.Clear();
             _privateTrackIds.Clear();
             _nextPrivateTrackId = PrivateTrackBase;
             _nextFullSweep = 0f;
@@ -254,7 +348,7 @@ namespace SeapowerMultiplayer
                 ? (AI.Compliance)ov.Compliance
                 : AI.Compliance.Unknown;
 
-        private static readonly Dictionary<int, (int trackId, bool classified, string cls, byte compliance)> _lastSent = new(128);
+        private static readonly Dictionary<Team, Dictionary<int, (int trackId, byte side, string cls, byte compliance)>> _lastSentByTeam = new();
         private static readonly ContactSyncMessage _msg = new();
         private static readonly HashSet<int> _seen = new(128);
         private static float _nextFullSweep;
@@ -265,17 +359,30 @@ namespace SeapowerMultiplayer
         /// becoming one large fragmented send.</summary>
         private const int MaxEntriesPerPacket = 24;
 
-        /// <summary>CO-OP ONLY. Both players command one task force and are meant to
-        /// share its picture, so making it consistent costs nothing.
+        /// <summary>Teammates command one task force and are meant to share its
+        /// picture, so making it consistent costs nothing.
         ///
-        /// In PvP the two players are opponents with deliberately separate pictures.
-        /// Sharing them would hand over identifications the other side has not
-        /// earned - the client would learn a contact is a Kirov the moment the host
-        /// worked it out - which is the same intel leak
-        /// SessionManager.ClearDetectionData exists to prevent at join. Nothing here
-        /// runs in PvP; every caller checks first, and this is the backstop.</summary>
-        internal static bool CoopSessionActive
-            => !Plugin.Instance.CfgPvP.Value && NetworkManager.Instance.IsEstablished;
+        /// Opponents keep deliberately separate pictures. Sharing them would hand over
+        /// identifications the other side has not earned - they would learn a contact is
+        /// a Kirov the moment we worked it out - which is the same intel leak
+        /// SessionManager.ClearDetectionData exists to prevent at join. The picture is
+        /// TEAM-scoped: it goes to teammates and no further. Every caller checks first,
+        /// and this is the backstop.</summary>
+        internal static bool TeamSessionActive
+            => Teams.HasTeammates && NetworkManager.Instance.IsEstablished;
+
+        internal static bool TeamShares(Team team)
+            => NetworkManager.Instance.IsEstablished && PlayerRegistry.CountOnTeam(team) >= 2;
+
+        internal static bool HostAnyTeamShares
+        {
+            get
+            {
+                foreach (var team in SideTable.All)
+                    if (TeamShares(team)) return true;
+                return false;
+            }
+        }
 
         /// <summary>Host: release the client's picture back to its own sensors.
         /// An empty full sweep clears the override table; without this, switching
@@ -283,27 +390,43 @@ namespace SeapowerMultiplayer
         /// the host last sent, forever.</summary>
         public static void HostBroadcastClear()
         {
-            if (!NetworkManager.Instance.IsEstablished) return;
-            _lastSent.Clear();
+            _lastSentByTeam.Clear();
             _nextFullSweep = 0f;
+            if (!NetworkManager.Instance.IsEstablished) return;
             _msg.Reset();
             _msg.IsFull = true;
-            NetworkManager.Instance.BroadcastToClients(_msg, DeliveryMethod.ReliableOrdered);
+            foreach (var team in SideTable.All)
+                NetworkManager.Instance.SendToTeam(team, _msg, DeliveryMethod.ReliableOrdered);
             _msg.Reset();
             Plugin.Log.LogInfo("[Contacts] Sync disabled - released the client's contact picture");
         }
 
-        /// <summary>Host: sweep the plotting table and send what changed.</summary>
+        /// <summary>
+        /// Host: sweep each sharing team's plotting table and send what changed
+        /// to that team, keeping change detection separate for each audience.
+        /// </summary>
         public static void HostBroadcast()
         {
-            if (!CoopSessionActive) return;
-
-            var table = Globals._playerTaskforce?.PlottingTable;
-            if (table == null) return;
+            if (!Plugin.Instance.CfgIsHost.Value || !HostAnyTeamShares) return;
 
             bool full = Time.unscaledTime >= _nextFullSweep;
             if (full) _nextFullSweep = Time.unscaledTime + FullSweepInterval;
 
+            foreach (var team in SideTable.All)
+            {
+                if (!TeamShares(team)) continue;
+                var table = Teams.TaskforceFor(team)?.PlottingTable;
+                if (table == null) continue;
+                if (!_lastSentByTeam.TryGetValue(team, out var lastSent))
+                    _lastSentByTeam[team] = lastSent = new Dictionary<int, (int, byte, string, byte)>(128);
+
+                SweepTeam(team, table, lastSent, full);
+            }
+        }
+
+        private static void SweepTeam(Team team, PlottingTable table,
+            Dictionary<int, (int trackId, byte side, string cls, byte compliance)> lastSent, bool full)
+        {
             _msg.Reset();
             // Only the first packet of a full sweep clears the client's table; the
             // continuation packets carry the rest of the same sweep and must not.
@@ -322,7 +445,7 @@ namespace SeapowerMultiplayer
                 int id = obj.UniqueID;
                 _seen.Add(id);
 
-                bool classified = vehicle.UnitTaskforce.Value != null;
+                byte side = SideCodeFor(vehicle, obj);
                 string cls = ReadClassName(vehicle);
 
                 // Only neutrals answer an identification request; for anyone else the
@@ -333,46 +456,54 @@ namespace SeapowerMultiplayer
                     ? (byte)obj._ai.CurrentCompliance
                     : (byte)AI.Compliance.Unknown;
 
-                var current = (vehicle.Id, classified, cls, compliance);
-                if (!full && _lastSent.TryGetValue(id, out var previous) && previous == current)
+                var current = (vehicle.Id, side, cls, compliance);
+                if (!full && lastSent.TryGetValue(id, out var previous) && previous == current)
                     continue;
 
-                _lastSent[id] = current;
+                lastSent[id] = current;
                 _msg.Entries.Add(new ContactSyncMessage.Entry
                 {
                     UniqueId   = id,
                     TrackId    = vehicle.Id,
-                    Classified = classified,
+                    Side       = side,
                     ClassName  = cls,
                     Compliance = compliance,
                 });
 
                 if (_msg.Entries.Count >= MaxEntriesPerPacket)
-                    Flush();
+                    Flush(team);
             }
 
-            if (full) PruneLastSent();
+            if (full) PruneLastSent(lastSent);
             // An empty full sweep still has to go out - that is what tells the
             // client every contact is gone. A later empty packet of the same
             // sweep does not: it would clear what the earlier ones just set.
             if (_msg.Entries.Count > 0 || (full && _sweepPacketsSent == 0))
-                Flush();
+                Flush(team);
+        }
+
+        /// <summary>Make the next sweep a full one, so a joining teammate receives the
+        /// whole picture instead of only what changes from now on.</summary>
+        public static void ForceFullSweep()
+        {
+            _lastSentByTeam.Clear();
+            _nextFullSweep = 0f;
         }
 
         /// <summary>Drop change-tracking for contacts the host no longer holds, so a
         /// re-detected object is re-sent rather than suppressed as "unchanged".</summary>
-        private static void PruneLastSent()
+        private static void PruneLastSent(Dictionary<int, (int trackId, byte side, string cls, byte compliance)> lastSent)
         {
-            if (_lastSent.Count == _seen.Count) return;
+            if (lastSent.Count == _seen.Count) return;
             var stale = new List<int>();
-            foreach (var id in _lastSent.Keys)
+            foreach (var id in lastSent.Keys)
                 if (!_seen.Contains(id)) stale.Add(id);
-            for (int i = 0; i < stale.Count; i++) _lastSent.Remove(stale[i]);
+            for (int i = 0; i < stale.Count; i++) lastSent.Remove(stale[i]);
         }
 
-        private static void Flush()
+        private static void Flush(Team team)
         {
-            NetworkManager.Instance.BroadcastToClients(_msg, DeliveryMethod.ReliableOrdered);
+            NetworkManager.Instance.SendToTeam(team, _msg, DeliveryMethod.ReliableOrdered);
             _sweepPacketsSent++;
             _msg.Reset(); // clears IsFull - continuation packets never re-clear
         }

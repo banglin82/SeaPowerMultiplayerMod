@@ -56,6 +56,14 @@ namespace SeapowerMultiplayer
             var fd = carrier?._obp?._flightDeck;
             if (fd == null) return;
 
+            // Embarked troops. The Flight Ops window polls this list itself (every 5 s),
+            // so replacing it is all the UI needs.
+            if (msg.GroundCargo != GroundCargoWire.Encode(carrier!.GroundCargoManifest))
+            {
+                carrier.GroundCargoManifest.Clear();
+                carrier.GroundCargoManifest.AddRange(GroundCargoWire.Decode(msg.GroundCargo));
+            }
+
             var vob = fd._vehiclesOnBoard;
 
             // Availability + ammo the Flight Ops "aircraft to prepare" list reads.
@@ -230,6 +238,18 @@ namespace SeapowerMultiplayer
                 Singleton<LanguageResourceHandler>.Instance.getText("Windows", "Launch"), null,
                 new DelegateCommand(delegate
                 {
+                    // This command REPLACES the vanilla AllowLaunchFunc on a client, so
+                    // the ownership prefix on that method never sees it - the same test
+                    // has to be made here. Without it a client could launch off a
+                    // teammate's carrier; the host refuses the order, but silently, and
+                    // the player is owed the refusal notice rather than a dead button.
+                    var ship = ReplicaRegistry.Find(carrierId) ?? StateSerializer.FindById(carrierId);
+                    if (FormationOwnership.BlocksOrdersFor(ship))
+                    {
+                        OrderRefusalNotice.Note(ship);
+                        return;
+                    }
+
                     NetworkManager.Instance.SendToServer(new PlayerOrderMessage
                     {
                         SourceEntityId = carrierId,

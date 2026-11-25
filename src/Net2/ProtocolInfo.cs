@@ -15,7 +15,43 @@ namespace SeapowerMultiplayer.Net2
         // toggle, and Hello/Welcome each carry the sender's packed gameplay options plus
         // its enabled-mod fingerprint. One bump, because none of them had shipped yet -
         // keep adding to this line until it does.
-        public const ushort ProtocolVersion = 230;
+        // 233 is 0.3.7's wire changes and the N-player overhaul landing together. Both
+        // branches independently claimed a number (231 here, 232 there), so neither is
+        // safe to reuse - a peer that saw the OTHER 231 would pair and then disagree
+        // about the Welcome layout. 233 is the first value that means "both".
+        //
+        // From 0.3.7: Welcome carries the host's "disable F10 debug menu" rule;
+        // PlayerOrder's AttackAtWaypoint Speed packing widened to carry the waypoint
+        // insertion index; ContactSync's per-contact Classified bool widened into a side
+        // CODE (unknown / neutral cover / actual side) so a disguised spy unit's cover
+        // identity stops resolving to its real taskforce on the client.
+        //
+        // From the N-player work: Hello carries a requested TEAM and a display name
+        // instead of a PvP flag, Welcome carries the assigned slot/team and a per-slot
+        // UID band, and PlayerRoster and UnitOwnership are new. The session-wide
+        // PvP/co-op mode is gone - team is a property of each player now, because a 2v1
+        // is co-op and PvP at the same time and no single flag could say so.
+        // 234: UnitStatus carries each air unit's home base id. The client could never
+        // derive one itself (vanilla's SearchForHomeBase runs only from AI.OnFixedUpdate,
+        // which is suppressed there), and all three of the game's return-to-base entry
+        // points are guarded on _homeBase being non-null - so a guest's RTB order either
+        // never left the machine or arrived with no base attached.
+        // 235: the session seats 8 players instead of 4. No field changed shape, but the
+        // slot a host may hand out did: a 4-slot build that pairs with an 8-slot host and
+        // is seated at slot 4+ walks off the end of its own roster array, so the two must
+        // not be allowed to meet.
+        // 236 (steam): wire-guided torpedo control and the WeaponWireState message (39).
+        // 236 (1.0.2): the game update that introduced Standing Orders - DoctrineSync,
+        // Hello/Welcome's GameplayOptions byte reserved (always 0), new PlayerOrder types.
+        // 238 is both branches merged: DoctrineSync moved to 40 to clear WeaponWireState,
+        // and PR #18's TorpedoWire* orders (36-40) gave way to WeaponCommand/WeaponOp (36).
+        // Neither 236 nor 237 is safe to pair with this layout.
+        // 239: the game's multi-side missions. A team byte is now an index into the
+        // host's SideTable (41), runtime relation changes ride SideRelation (42), and
+        // EntitySpawn names its taskforce instead of carrying a TfType byte. FlightDeckState
+        // carries the carrier's embarked ground cargo (game 0.9 transport launches).
+        // Mission triggers fire on the host only: TriggerFired (43) / TriggerRequest (44).
+        public const ushort ProtocolVersion = 239;
 
         /// <summary>
         /// The Sea Power build both players are running. Save files embed indices
@@ -32,6 +68,21 @@ namespace SeapowerMultiplayer.Net2
         /// <summary>Start of the client-local UID band (sent in Welcome). Host-assigned
         /// ids stay far below this, so client-side spawns can never collide.</summary>
         public const int ClientUidBase = 100_000_000;
+
+        /// <summary>Width of each guest's private UID band.</summary>
+        public const int ClientUidBandSize = 100_000_000;
+
+        /// <summary>
+        /// Per-slot UID band. Guests used to share one band, which was fine while there
+        /// was only ever one of them and a guaranteed collision the moment there were
+        /// two: both would floor their allocator to the same number and hand out the same
+        /// ids for unrelated local objects.
+        ///
+        /// Slots 1..7 → 100M..700M, comfortably inside int.MaxValue. The wire format
+        /// already carried this per-client in Welcome, so nothing else has to change.
+        /// </summary>
+        public static int UidBaseForSlot(byte slot)
+            => slot < 1 ? 0 : ClientUidBase + (slot - 1) * ClientUidBandSize;
 
         /// <summary>Self-imposed cap for unreliable state packets. LiteNetLib 1.3.5
         /// THROWS TooBigPacketException for Unreliable payloads above

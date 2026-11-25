@@ -98,7 +98,7 @@ namespace SeapowerMultiplayer
         public static float CustomCommandKnots(ObjectBase unit)
         {
             var cmd = unit?.SpeedCommand?.Value;
-            if (cmd == null || cmd is TelegraphSpeed) return float.NaN;
+            if (cmd == null || cmd.Kind == SpeedKind.Telegraph || cmd.Kind == SpeedKind.None) return float.NaN;
             // ConstantSpeed knows its raw commanded knots; ConstantMach reports NaN
             // there and has to be re-derived from mach at the unit's current height.
             float kts = cmd.CommandSpeedInKnots;
@@ -275,13 +275,13 @@ namespace SeapowerMultiplayer
         {
             var reassignments = new List<(ObjectBase obj, int hostId)>();
 
-            // PvP: the state update contains the remote player's units. After PvP
-            // taskforce swap, those units are in our EnemyTaskforce locally. Only
-            // match against enemy units to prevent accidentally remapping our own
-            // aircraft to remote IDs (which would make our aircraft invisible to
-            // the remote side).
-            bool isPvP = Plugin.Instance.CfgPvP.Value;
-            Taskforce alignFilter = isPvP ? GetEnemyTaskforce() : null;
+            // On a reseated guest the host's units are on other sides than ours locally.
+            // Never match against our own taskforce, to prevent accidentally remapping
+            // our own aircraft to remote IDs (which would make our aircraft invisible to
+            // the other side). A guest on the host's side shares the host's taskforce,
+            // so it has no such split and needs no filter.
+            bool swapped = Teams.LocalSaveSwapped;
+            Taskforce alignExclude = swapped ? Globals._playerTaskforce : null;
 
             foreach (var state in units)
             {
@@ -297,7 +297,7 @@ namespace SeapowerMultiplayer
                 Vector2 local = Utils.longLatToLocal(geo, Globals._currentCenterTile);
                 Vector3 worldPos = new Vector3(local.x, state.Y, local.y);
 
-                var best = FindLocalByPosition(worldPos, state.Kind, alignFilter);
+                var best = FindLocalByPosition(worldPos, state.Kind, alignExclude);
                 if (best != null && best.UniqueID != state.EntityId)
                     reassignments.Add((best, state.EntityId));
             }
@@ -326,27 +326,8 @@ namespace SeapowerMultiplayer
             Plugin.Log.LogInfo($"[StateApplier] Alignment: {reassignments.Count} units remapped from first state update");
         }
 
-        /// <summary>
-        /// Returns the enemy taskforce (the remote player's taskforce).
-        /// In PvP, the state update contains the remote player's units,
-        /// which are in our local EnemyTaskforce after the PvP swap.
-        /// </summary>
-        private static Taskforce GetEnemyTaskforce()
-        {
-            var playerTf = Globals._playerTaskforce;
-            if (playerTf == null || !Singleton<TaskforceManager>.InstanceExists(false))
-                return null;
-
-            foreach (var tf in Singleton<TaskforceManager>.Instance._taskForces)
-            {
-                if (tf != playerTf)
-                    return tf;
-            }
-            return null;
-        }
-
         private static ObjectBase FindLocalByPosition(Vector3 worldPos, UnitType kind,
-            Taskforce taskforceFilter = null)
+            Taskforce excludeTaskforce = null)
         {
             ObjectBase best = null;
             float bestDist = float.MaxValue;
@@ -356,7 +337,7 @@ namespace SeapowerMultiplayer
                 var obj = all[i];
                 if (obj == null || obj.IsDestroyed) continue;
                 if (!KindMatches(obj, kind)) continue;
-                if (taskforceFilter != null && obj._taskforce != taskforceFilter) continue;
+                if (excludeTaskforce != null && obj._taskforce == excludeTaskforce) continue;
                 float d = (obj.transform.position - worldPos).sqrMagnitude;
                 if (d < bestDist) { bestDist = d; best = obj; }
             }
@@ -431,6 +412,15 @@ namespace SeapowerMultiplayer
                                   $"{reason} (unit={unit.name})");
         }
 
+        /// <summary>The weapon menu's own write: create the per-ammo entry on first use,
+        /// otherwise set its Value so anything observing it (the menu's check marks)
+        /// sees the change.</summary>
+        private static void SetLaunchSetting<T>(Dictionary<string, UniRx.ReactiveProperty<T>> settings, string ammo, T value)
+        {
+            if (settings.TryGetValue(ammo, out var setting)) setting.Value = value;
+            else settings[ammo] = new UniRx.ReactiveProperty<T>(value);
+        }
+
         public static void Apply(PlayerOrderMessage msg)
         {
             if (SessionManager.SceneLoading || SimSyncManager.CurrentState != SimState.Synchronized) return;
@@ -480,6 +470,45 @@ namespace SeapowerMultiplayer
                 return;
             }
 
+            // Team-level authority check. The sender is identified by its CONNECTION
+            // (PlayerRegistry.SenderSlot, set by NetworkManager.ApplyAs), never by a
+            // field in the message, so it cannot be forged. NoSender means the call came
+            // from the host's own code rather than off the wire.
+            byte sender = PlayerRegistry.SenderSlot;
+            if (Plugin.Instance.CfgIsHost.Value && sender != PlayerRegistry.NoSender)
+            {
+                if (!PlayerRegistry.MayCommand(sender, unit))
+                {
+                    LogRejectedOrder(msg, unit, $"slot {sender} does not command that side");
+                    return;
+                }
+
+                // The per-formation gate, checked HERE and not only on the sender.
+                // Enforcing it solely at the sending end would make ownership a
+                // convention that any stale or buggy client could ignore, and the
+                // relay below would then hand that order to their teammates too.
+                //
+                // ClassifyContact is exempt for the same reason the send-side backstop
+                // exempts it: its SourceEntityId is a CONTACT, not one of our units, so
+                // the ownership question does not apply to it at all.
+                if (msg.Order != Messages.OrderType.ClassifyContact
+                    && !FormationOwnership.MaySend(sender, msg.SourceEntityId))
+                {
+                    LogRejectedOrder(msg, unit, $"slot {sender} does not own that unit");
+                    return;
+                }
+            }
+
+            // Pass it on to the sender's OTHER teammates - they have no connection to
+            // each other, so the host is the only thing that can tell them.
+            //
+            // Deliberately here rather than at receipt in Dispatch: everything above is
+            // a reason the host might refuse this order, and a relayed order the host
+            // then declined would leave the teammates acting on something that never
+            // happened. Below every guard means relayed implies applied.
+            if (sender != PlayerRegistry.NoSender)
+                NetworkManager.Instance.RelayToTeam(sender, msg);
+
             var logKey = (msg.SourceEntityId, msg.Order);
             if (_logThrottle.TryGetValue(logKey, out var throttle) && Time.unscaledTime - throttle.lastLogTime < LogInterval)
             {
@@ -510,6 +539,11 @@ namespace SeapowerMultiplayer
                         // Aircraft overrides too. (The old `is Vessel` cast silently
                         // dropped every submarine speed order.)
                         unit.setTelegraph((int)msg.Speed);
+                        // The aircraft speed presets mark the speed as the player's
+                        // (ObjectSpeed sets _speedSetByPlayer), which is what stops the
+                        // combat states overriding it (AllowCombatSpeedControl). That ran
+                        // in the sender's UI, not here.
+                        if (unit.IsAirUnit) unit._speedSetByPlayer = true;
                         break;
 
                     case Messages.OrderType.LaunchChaff:
@@ -517,11 +551,19 @@ namespace SeapowerMultiplayer
                         break;
 
                     case Messages.OrderType.LaunchNoisemaker:
-                        // launchNoisemaker is declared on Submarine/Vessel (not
-                        // ObjectBase); it queues a noisemaker EngageTask the host
-                        // fires natively, replicating the decoy back to the client.
-                        if (unit is Submarine subNm) subNm.launchNoisemaker();
+                        // Two senders, two shapes. The weapons-panel button names the
+                        // ammo the player chose, so launch exactly that - a ship can
+                        // carry more than one noisemaker type and picking for them
+                        // would be wrong. The hotkey path sends no ammo; fall back to
+                        // Submarine/Vessel.launchNoisemaker(), which chooses the first
+                        // type with a launcher that is loaded and idle. (Both are
+                        // declared there, not on ObjectBase.)
+                        if (!string.IsNullOrEmpty(msg.AmmoId))
+                            unit.LaunchNoisemaker(msg.AmmoId);
+                        else if (unit is Submarine subNm) subNm.launchNoisemaker();
                         else if (unit is Vessel vesNm) vesNm.launchNoisemaker();
+                        Plugin.Log.LogInfo($"[Decoy] LaunchNoisemaker applied: unit={unit.UniqueID} " +
+                                           $"({unit.name}) ammo={(string.IsNullOrEmpty(msg.AmmoId) ? "<auto>" : msg.AmmoId)}");
                         break;
 
                     case Messages.OrderType.DropFuelTanks:
@@ -530,6 +572,17 @@ namespace SeapowerMultiplayer
                         // this machine worked out for itself makes this a no-op.
                         unit.DropFueltanks(msg.Speed != 0f);
                         break;
+
+                    case Messages.OrderType.ForceReload:
+                    {
+                        // Self-guarding (CanForceReload), so a mount that cannot take
+                        // it here - already reloading, nothing spare - is a no-op.
+                        int mount = (int)msg.Heading;
+                        var mounts = unit._obp?._weaponSystems;
+                        if (mounts != null && mount >= 0 && mount < mounts.Count)
+                            mounts[mount].ForceReload();
+                        break;
+                    }
 
                     case Messages.OrderType.ManualGunFire:
                     {
@@ -584,6 +637,11 @@ namespace SeapowerMultiplayer
                             _launchCount = launchCount,
                             _missionType = (FlightDeckTask.MissionType)msg.ShotsToFire,
                         };
+                        // Troops the sender picked for a transport launch; createLaunchTask
+                        // validates them against this carrier and takes them aboard.
+                        ltp._groundCargo.AddRange(GroundCargoWire.Decode(msg.AmmoId));
+                        // The sender's own "launch on Weapons X" option - see LaunchWeaponState.
+                        LaunchWeaponState.Request(ltp, msg.TargetX);
                         fd.createLaunchTask(vehicle, loadout, squadron, callsign, ltp, msg.TargetEntityId == 1);
                         Plugin.Log.LogInfo($"[Order] LaunchAircraft: carrier={unit.UniqueID} vehicle={vehicleIdx} count={launchCount}");
                         break;
@@ -654,10 +712,11 @@ namespace SeapowerMultiplayer
                         if (msg.TargetEntityId > 0)
                             target = StateSerializer.FindById(msg.TargetEntityId);
                         var targetPos = new Vector3(msg.TargetX, msg.TargetY, msg.TargetZ);
-                        // PvP: coordinates are always GeoPosition - always convert back.
-                        // This is needed even when target is found, because the game falls
-                        // back to targetPosition if the target is destroyed mid-flight.
-                        if (Plugin.Instance.CfgPvP.Value)
+                        // Coordinates are always GeoPosition - always convert back. Needed
+                        // even when the target is found, because the game falls back to
+                        // targetPosition if the target dies mid-flight. (Unconditional
+                        // since the sender stopped pretending teammates share a floating
+                        // origin - see the encode in Patch_ObjectBase_FireWeapon.)
                         {
                             var geo = new GeoPosition { _longitude = msg.TargetX, _latitude = msg.TargetZ, _height = msg.TargetY };
                             Vector2 local = Utils.longLatToLocal(geo, Globals._currentCenterTile);
@@ -690,6 +749,8 @@ namespace SeapowerMultiplayer
                     // through setTelegraph - it replaces the whole speed command.
                     case Messages.OrderType.SetSpeedCustom:
                         StateSerializer.ApplyCustomSpeed(unit, msg.Speed);
+                        // ObjectAirVehicleVelocity.CommitSliderValue's own flag - see SetSpeed.
+                        if (unit.IsAirUnit) unit._speedSetByPlayer = true;
                         if (unit is Submarine spdSub)
                             Patch_Submarine_SetTelegraph.NoteRemoteCustomSpeed(spdSub);
                         else if (unit is Vessel spdVessel)
@@ -717,10 +778,10 @@ namespace SeapowerMultiplayer
 
                     case Messages.OrderType.CeaseFire:
                     {
-                        // PvP: suppress radio report for enemy units so players
-                        // don't hear the other side's comms
-                        bool report = !(Plugin.Instance.CfgPvP.Value
-                                     && unit._taskforce != Globals._playerTaskforce);
+                        // Radio chatter only for our OWN side's units - you never want to
+                        // hear the opposition's comms, and in a co-op session the unit is
+                        // on _playerTaskforce anyway, so this is right in both cases.
+                        bool report = unit._taskforce == Globals._playerTaskforce;
                         unit.CeaseFire(report, true, true, false, true, true);
                         break;
                     }
@@ -812,32 +873,33 @@ namespace SeapowerMultiplayer
                         var root = unit._userRoot;
                         if (root != null && wpIdx >= 0 && wpIdx < root.TaskViewModels.Count)
                         {
-                            if (root.TaskViewModels[wpIdx].Task is GoToWaypointTask wp)
+                            // Never an attack/sonobuoy-drop waypoint - see the sender in
+                            // Patch_UserRootNode_UpdateSimulation. Enforced here too so a
+                            // peer on an older build cannot move a drop waypoint out from
+                            // under a queue that is already running.
+                            if (root.TaskViewModels[wpIdx].Task is GoToWaypointTask wp
+                                && !(wp is AttackAtWaypoint))
                                 wp._waypointGeoPos.value = new GeoPosition
                                 {
                                     _longitude = msg.DestX,
                                     _latitude  = msg.DestZ,
                                     _height    = msg.DestY,
                                 };
+                            else if (root.TaskViewModels[wpIdx].Task is AttackAtWaypoint)
+                                Plugin.Log.LogInfo($"[Order] EditWaypoint ignored for drop/attack waypoint: " +
+                                                   $"unit={unit.UniqueID} idx={wpIdx}");
                         }
                         break;
                     }
 
                     case Messages.OrderType.DropSonobuoy:
                     {
-                        Vector3 dropPos;
-                        if (Plugin.Instance.CfgPvP.Value)
-                        {
-                            // PvP: coordinates are GeoPosition (floating-origin safe)
-                            var geo = new GeoPosition { _longitude = msg.DestX, _latitude = msg.DestZ, _height = msg.DestY };
-                            Vector2 local = Utils.longLatToLocal(geo, Globals._currentCenterTile);
-                            dropPos = new Vector3(local.x, msg.DestY, local.y);
-                        }
-                        else
-                        {
-                            // Co-op: coordinates are already in local Unity space (shared origin)
-                            dropPos = new Vector3(msg.DestX, msg.DestY, msg.DestZ);
-                        }
+                        // Always GeoPosition (floating-origin safe) - see the encode in
+                        // Patch_ObjectBase_FireWeapon for why the old co-op "shared local
+                        // origin" branch was wrong rather than merely redundant.
+                        var buoyGeo = new GeoPosition { _longitude = msg.DestX, _latitude = msg.DestZ, _height = msg.DestY };
+                        Vector2 buoyLocal = Utils.longLatToLocal(buoyGeo, Globals._currentCenterTile);
+                        Vector3 dropPos = new Vector3(buoyLocal.x, msg.DestY, buoyLocal.y);
 
                         unit.AddEngageTask(new EngageTask(msg.AmmoId, dropPos, unit, 1));
                         Plugin.Log.LogInfo($"[Sonobuoy] Applied drop: unit={unit.UniqueID} ammo={msg.AmmoId}");
@@ -868,7 +930,9 @@ namespace SeapowerMultiplayer
                         // to the client as part of the normal shared picture.
                         var contact = StateSerializer.FindById(msg.TargetEntityId);
                         if (contact == null || contact.IsDestroyed) break;
-                        if (Plugin.Instance.CfgPvP.Value) break;
+                        // Only meaningful when the asking unit's team shares a picture.
+                        var askTeam = Teams.TeamOf(unit);
+                        if (askTeam == null || !ContactSyncManager.TeamShares(askTeam.Value)) break;
 
                         // Re-check against OUR roll, which is the authoritative one.
                         // A client running a stale value cannot talk a merchant into
@@ -896,20 +960,31 @@ namespace SeapowerMultiplayer
                             ? StateSerializer.FindById(msg.TargetEntityId) : null;
                         int flags = (int)msg.Speed;
 
-                        // after=null appends. The issuing side chains each task after
-                        // the previous one, so a multi-drop pattern lands in the same
-                        // order here; only a drop inserted mid-route (a waypoint was
-                        // selected) ends up at the end of the list instead.
+                        // The insertion point, addressed by index (see
+                        // Patch_ObjectBase_SetAttackAtWaypointTask). A queued drop is a
+                        // CHAIN - each one is issued after the task before it - so
+                        // appending every arrival put the host's list in a different
+                        // order than the issuer's whenever the unit already had a route.
+                        // Out of range (lists drifted) falls back to appending, which is
+                        // the old behaviour and never throws.
+                        int afterIdx = ((flags >> 10) & 0x3FFF) - 1;
+                        VisualActionTask? after = null;
+                        var atkRoot = unit._userRoot;
+                        if (atkRoot != null && afterIdx >= 0 && afterIdx < atkRoot.TaskViewModels.Count)
+                            after = atkRoot.TaskViewModels[afterIdx].Task;
+
                         var atkTask = unit.SetAttackAtWaypointTask(
                             msg.AmmoId, atkTarget,
                             new GeoPosition { _longitude = msg.TargetX, _latitude = msg.TargetZ, _height = msg.TargetY },
                             new GeoPosition { _longitude = msg.DestX,   _latitude = msg.DestZ,   _height = msg.DestY },
-                            msg.ShotsToFire, null,
+                            msg.ShotsToFire, after,
                             (EngageTask.SalvoType)(flags & 0xFF), msg.Heading,
                             (flags & 0x100) != 0, (flags & 0x200) != 0);
 
                         Plugin.Log.LogInfo($"[Order] AttackAtWaypoint: unit={unit.UniqueID} ammo={msg.AmmoId} " +
-                            $"target={msg.TargetEntityId} salvo={msg.ShotsToFire} created={atkTask != null}");
+                            $"target={msg.TargetEntityId} salvo={msg.ShotsToFire} " +
+                            $"afterIdx={afterIdx} anchored={after != null} " +
+                            $"tasks={atkRoot?.TaskViewModels.Count ?? -1} created={atkTask != null}");
                         break;
                     }
 
@@ -939,6 +1014,29 @@ namespace SeapowerMultiplayer
                         ObjectBase? homeBase = null;
                         if (msg.TargetEntityId != 0)
                             homeBase = StateSerializer.FindById(msg.TargetEntityId);
+
+                        // Fall back to the HOST's own answer when the sender had none.
+                        // The guest's T-key path for a helicopter (InputHandler.cs:1731)
+                        // passes getHomeBase() straight through, so it reaches here as 0
+                        // whenever the guest's replica has not been told the base yet -
+                        // and setOrder(ReturnToBase, null) is accepted and then does
+                        // nothing, which is the "aircraft doesn't respond" report. The
+                        // host resolves _homeBase normally (its AI.OnFixedUpdate runs
+                        // SearchForHomeBase), so it is the better answer in every case
+                        // where the two differ.
+                        if (homeBase == null)
+                        {
+                            homeBase = unit.getHomeBase();
+                            if (homeBase != null)
+                                Plugin.Log.LogInfo($"[Order] ReturnToBase for {unit.name} " +
+                                    $"(id={msg.SourceEntityId}) arrived with no base - using the host's " +
+                                    $"{homeBase.getUIDAndName()}");
+                        }
+
+                        if (homeBase == null)
+                            Plugin.Log.LogWarning($"[Order] ReturnToBase for {unit.name} " +
+                                $"(id={msg.SourceEntityId}): neither side knows a home base - " +
+                                "the order will not take.");
 
                         OrderHandler.ApplyingFromNetwork = true;
                         try { unit.setOrder(Order.Type.ReturnToBase, homeBase, displayOrderText: true); }
@@ -984,6 +1082,75 @@ namespace SeapowerMultiplayer
                             Plugin.Log.LogInfo($"[Order] Applied JamSystem for {unit?.name} " +
                                 $"(id={msg.SourceEntityId}): bearing {msg.TargetZ:F3},{msg.TargetX:F3}");
                         }
+                        break;
+                    }
+
+                    case Messages.OrderType.WeaponCommand:
+                    {
+                        // Host only: the round is the host's, and a teammate's copy
+                        // learns the outcome from the stream (and WeaponWireLost).
+                        if (!Plugin.Instance.CfgIsHost.Value) break;
+
+                        var op = (WeaponOp)(int)msg.Heading;
+                        // Addressed through its platform (see WeaponCommandSync) - the
+                        // ownership checks above were asked about that platform, so the
+                        // round has to actually be its.
+                        if (!(StateSerializer.FindById(msg.ShotsToFire) is WeaponBase cmdWeapon)
+                            || cmdWeapon.IsDestroyed
+                            || StateSerializer.GetLaunchPlatform(cmdWeapon) != unit)
+                        {
+                            LogRejectedOrder(msg, unit, $"{op}: weapon {msg.ShotsToFire} not found or not launched by this unit");
+                            break;
+                        }
+
+                        switch (op)
+                        {
+                            case WeaponOp.CutWire:      cmdWeapon.CommandCutWire(); break;
+                            case WeaponOp.SelfDestruct: cmdWeapon.CommandSelfDestruct(); break;
+                            case WeaponOp.WireSpeed:
+                                if (cmdWeapon is Torpedo speedTorp) speedTorp.SetWireSpeedSetting((int)msg.Speed);
+                                break;
+                            case WeaponOp.WireDepth:
+                                if (cmdWeapon is Torpedo depthTorp) depthTorp.OrderWireDepth(msg.Speed);
+                                break;
+                            case WeaponOp.Retarget:
+                            {
+                                var newTarget = StateSerializer.FindById(msg.TargetEntityId);
+                                if (newTarget != null) cmdWeapon.RetargetWeapon(newTarget);
+                                break;
+                            }
+                            case WeaponOp.RetargetGeo:
+                                // Geo on the wire unconverted, as JamSystem's bearing form.
+                                cmdWeapon.RetargetWeaponToGeoPosition(new GeoPosition
+                                {
+                                    _longitude = msg.TargetX,
+                                    _latitude  = msg.TargetZ,
+                                    _height    = msg.TargetY,
+                                });
+                                break;
+                        }
+                        Plugin.Log.LogInfo($"[Order] Applied WeaponCommand {op}: weapon={cmdWeapon.UniqueID} " +
+                            $"({cmdWeapon.name}) platform={unit.UniqueID} arg={msg.Speed} target={msg.TargetEntityId}");
+                        break;
+                    }
+
+                    case Messages.OrderType.TorpedoLaunchSettings:
+                    {
+                        // Read off the launching unit at launch (CommonLaunchSettings /
+                        // Torpedo.TorpedoLaunchSettings), so the dictionaries are all the
+                        // host needs. NaN = that setting was not part of this change.
+                        string ammo = msg.AmmoId;
+                        if (string.IsNullOrEmpty(ammo)) break;
+                        if (!float.IsNaN(msg.Speed))
+                            SetLaunchSetting(unit._launchSeekerModeSettings, ammo, (AmmunitionParameters.LaunchSeekerMode)(int)msg.Speed);
+                        if (!float.IsNaN(msg.Heading))
+                            SetLaunchSetting(unit._launchSpeedSettings, ammo, (int)msg.Heading);
+                        if (!float.IsNaN(msg.DestX))
+                            SetLaunchSetting(unit._searchDepthSettings, ammo, (AmmunitionParameters.SearchDepth)(int)msg.DestX);
+                        if (!float.IsNaN(msg.DestY))
+                            SetLaunchSetting(unit._searchModeSettings, ammo, (AmmunitionParameters.SearchMode)(int)msg.DestY);
+                        Plugin.Log.LogInfo($"[Order] Applied TorpedoLaunchSettings for {unit.name} (id={msg.SourceEntityId}) " +
+                            $"ammo={ammo}: seeker={msg.Speed} speed={msg.Heading} depth={msg.DestX} mode={msg.DestY}");
                         break;
                     }
 
@@ -1285,9 +1452,10 @@ namespace SeapowerMultiplayer
                     }
                     break;
 
+                // RESERVED. Its manager never had a caller - one client owning one whole
+                // taskforce is what per-formation ownership replaced - but the value stays
+                // claimed so an older peer cannot have it re-read as something else.
                 case GameEventType.TaskforceAssigned:
-                    if (!Plugin.Instance.CfgIsHost.Value)
-                        TaskforceAssignmentManager.OnAssignmentReceived(msg.Param);
                     break;
 
                 case GameEventType.HardSyncRequest:
@@ -1297,6 +1465,43 @@ namespace SeapowerMultiplayer
                         SessionManager.CaptureAndSend();
                     }
                     break;
+
+                case GameEventType.AssignOwnership:
+                {
+                    // Host-only, and validated on three counts: the sender must own what
+                    // they are giving away, the recipient must exist, and the recipient
+                    // must be on the sender's own team. Without the last one a player
+                    // could hand their fleet to the opposition.
+                    if (!Plugin.Instance.CfgIsHost.Value) break;
+
+                    byte from = msg.Slot;
+                    byte to   = (byte)msg.Param;
+                    var target = StateSerializer.FindById(msg.SourceEntityId);
+
+                    if (target == null)
+                    {
+                        Plugin.Log.LogWarning($"[Ownership] Transfer refused: unit {msg.SourceEntityId} not found.");
+                        break;
+                    }
+                    if (!FormationOwnership.MaySend(from, msg.SourceEntityId))
+                    {
+                        Plugin.Log.LogWarning($"[Ownership] Transfer refused: slot {from} does not own unit {msg.SourceEntityId}.");
+                        break;
+                    }
+                    if (!PlayerRegistry.TryGet(to, out var recipient) || !recipient.Connected)
+                    {
+                        Plugin.Log.LogWarning($"[Ownership] Transfer refused: slot {to} is not in the session.");
+                        break;
+                    }
+                    if (!PlayerRegistry.TryGet(from, out var sender) || sender.Team != recipient.Team)
+                    {
+                        Plugin.Log.LogWarning($"[Ownership] Transfer refused: slot {to} is not on slot {from}'s team.");
+                        break;
+                    }
+
+                    FormationOwnership.HostAssignFormationOf(target, to);
+                    break;
+                }
 
                 case GameEventType.TimeProposal:
                     TimeSyncManager.OnProposalReceived(msg.Param, fromHost: !Plugin.Instance.CfgIsHost.Value);
@@ -1311,12 +1516,21 @@ namespace SeapowerMultiplayer
                         TimeSyncManager.SetHostVoteMode(msg.Param == 1f);
                     break;
 
-                case GameEventType.UnitSelected:
-                    UnitLockManager.OnRemoteSelected((int)msg.Param);
+                case GameEventType.WeaponWireLost:
+                    // BreakWire, not CommandCutWire: the host already decided, and the
+                    // operator check in front of the cut is not this machine's to make.
+                    // Its ConnectionLost flags are what the weapon panel reads.
+                    if (!Plugin.Instance.CfgIsHost.Value
+                        && (ReplicaRegistry.Find(msg.SourceEntityId) ?? StateSerializer.FindById(msg.SourceEntityId)) is WeaponBase wiredWeapon)
+                        wiredWeapon.BreakWire();
                     break;
 
+                // RESERVED, not removed. The transient selection lock these drove is
+                // gone (see the note where its patches used to live), but the enum values
+                // stay claimed so a peer on an older build cannot have them re-read as
+                // something else - AssignOwnership took the next free byte.
+                case GameEventType.UnitSelected:
                 case GameEventType.UnitDeselected:
-                    UnitLockManager.OnRemoteDeselected();
                     break;
 
                 case GameEventType.MissionEnd:

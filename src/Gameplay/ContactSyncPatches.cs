@@ -22,7 +22,7 @@ namespace SeapowerMultiplayer
         static void Postfix(Vehicle __instance)
         {
             if (!Suppression.ClientActive) return;
-            if (Plugin.Instance.CfgPvP.Value) return; // co-op only - opponents keep separate pictures
+            if (!Teams.HasTeammates) return; // nobody to share a picture with
             // Read live so switching the setting off on THIS machine reverts to our
             // own sensors immediately, without waiting on the host's clearing sweep.
             if (!Plugin.Instance.CfgContactSync.Value) return;
@@ -46,12 +46,15 @@ namespace SeapowerMultiplayer
 
             __instance.Id = ov.TrackId;
 
-            // "Classified" means the host has worked out whose the contact is; the
-            // side itself is resolved locally from the contact's real taskforce
-            // rather than sent, so nothing perspective-dependent crosses the wire.
-            if (ov.Classified && obj._taskforce != null)
+            // The host's side code says whether it has worked out whose the contact
+            // is AND whether that answer is the contact's real side or the neutral
+            // cover a disguised spy is still wearing; the taskforce object itself is
+            // resolved locally rather than sent, so nothing perspective-dependent
+            // crosses the wire.
+            var side = ContactSyncManager.ResolveSide(ov, obj);
+            if (side != null)
             {
-                __instance.UnitTaskforce.Value = obj._taskforce;
+                __instance.UnitTaskforce.Value = side;
 
                 // UnitTaskforce alone colours the contact but does not let the
                 // player look at it. MainGameViewModel resolves every click to a
@@ -61,7 +64,12 @@ namespace SeapowerMultiplayer
                 // never produce for a ship the host has identified. Without this
                 // a PID'd contact read as identified on the client and still
                 // could not be viewed - host only.
-                ContactSyncManager.ApplySideIfMissing(__instance, obj._taskforce);
+                ContactSyncManager.ApplySide(__instance, side);
+
+                // And where the host got there by seeing through a disguise, teach
+                // the client's own sensors the same thing, so they stop writing the
+                // cover side back over ours every tick.
+                ContactSyncManager.SyncSpyUnmasking(obj, ov.Side);
             }
 
             if (ov.BoxedClass != null && ContactSyncManager.ApplyClass(__instance, ov.BoxedClass))
@@ -86,7 +94,7 @@ namespace SeapowerMultiplayer
         static void Postfix(ObjectBase ____baseObject, ref AI.Compliance __result)
         {
             if (!Suppression.ClientActive) return;
-            if (Plugin.Instance.CfgPvP.Value) return; // co-op only, like the rest of the shared picture
+            if (!Teams.HasTeammates) return; // like the rest of the shared picture
             if (____baseObject == null || ____baseObject.UniqueID == 0) return;
 
             var shared = ContactSyncManager.ComplianceFor(____baseObject.UniqueID);
@@ -115,7 +123,7 @@ namespace SeapowerMultiplayer
         {
             if (sensorType != "Comms") return;
             if (!Suppression.ClientActive) return;
-            if (Plugin.Instance.CfgPvP.Value) return;
+            if (!Teams.HasTeammates) return;
             if (OrderHandler.ApplyingFromNetwork) return;
             if (hostObject == null || contactObject == null) return;
             if (hostObject.UniqueID == 0 || contactObject.UniqueID == 0) return;
@@ -149,7 +157,7 @@ namespace SeapowerMultiplayer
         static void Postfix(VehicleInfoViewModel __instance, Vehicle target)
         {
             if (!Suppression.ClientActive) return;
-            if (Plugin.Instance.CfgPvP.Value) return;
+            if (!Teams.HasTeammates) return;
             if (target == null) return;
 
             // DictionaryWithFallbacks yields placeholder text rather than throwing

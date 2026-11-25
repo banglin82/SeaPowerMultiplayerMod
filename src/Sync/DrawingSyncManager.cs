@@ -50,8 +50,13 @@ namespace SeapowerMultiplayer
             if (_resolved) return _writeDrawingData != null && _loadDrawingData != null;
             _resolved = true;
 
-            _writeDrawingData = AccessTools.Method(typeof(SaveLoadManager), "WriteDrawingData");
-            _loadDrawingData  = AccessTools.Method(typeof(SaveLoadManager), "LoadDrawingData");
+            // Both by exact signature: each now has an overload, and a by-name lookup
+            // would pick whichever it liked. The writer takes the layer to write; the
+            // parameterless loader reads [DrawingLayer] from the live mission ini.
+            var layerType = AccessTools.TypeByName("SeapowerUI.ViewModels.MapDrawingLayer");
+            _writeDrawingData = layerType == null ? null
+                : AccessTools.Method(typeof(SaveLoadManager), "WriteDrawingData", new[] { typeof(IniHandler), layerType });
+            _loadDrawingData  = AccessTools.Method(typeof(SaveLoadManager), "LoadDrawingData", Type.EmptyTypes);
 
             if (_writeDrawingData == null || _loadDrawingData == null)
             {
@@ -78,10 +83,11 @@ namespace SeapowerMultiplayer
         private static Dictionary<string, string>? Capture()
         {
             if (!Resolve()) return null;
-            if (Globals._mainGameViewModel?.Map?.DrawingLayer?.Graphics == null) return null;
+            var layer = Globals._mainGameViewModel?.Map?.DrawingLayer;
+            if (layer?.Graphics == null) return null;
 
             var scratch = new IniHandler(ScratchIni);
-            _writeDrawingData!.Invoke(null, new object[] { scratch });
+            _writeDrawingData!.Invoke(null, new object[] { scratch, layer });
 
             return scratch.doesSectionExist(Section)
                 ? new Dictionary<string, string>(scratch.GetSectionKeyValues(Section))
@@ -107,7 +113,7 @@ namespace SeapowerMultiplayer
         public static void PollAndSend()
         {
             if (_suppressPoll) return;
-            if (!ContactSyncManager.CoopSessionActive) return; // never hand an opponent your plot
+            if (!ContactSyncManager.TeamSessionActive) return; // never hand an opponent your plot
 
             Dictionary<string, string>? data;
             try { data = Capture(); }
@@ -136,7 +142,9 @@ namespace SeapowerMultiplayer
             foreach (var kv in data)
                 msg.Entries.Add((kv.Key, kv.Value));
 
-            NetworkManager.Instance.SendToOther(msg);
+            // Team-scoped: a map plot is the single most direct statement of intent
+            // a player can make, and SendToOther handed it to the opposition.
+            NetworkManager.Instance.SendToMyTeam(msg);
             Plugin.Log.LogInfo($"[Drawings] Sent {msg.Entries.Count} map drawing(s)");
         }
 
@@ -146,7 +154,7 @@ namespace SeapowerMultiplayer
         /// loader only ADDS, so the existing graphics are cleared first.</summary>
         public static void ApplyReceived(DrawingSyncMessage msg)
         {
-            if (Plugin.Instance.CfgPvP.Value) return; // co-op only
+            if (!Teams.HasTeammates) return; // nobody to share a drawing layer with
             if (!Resolve()) return;
 
             var layer = Globals._mainGameViewModel?.Map?.DrawingLayer;

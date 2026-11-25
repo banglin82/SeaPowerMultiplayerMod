@@ -77,30 +77,123 @@
       <HintPath>$(GameDir)\Sea Power_Data\Managed\Noesis.NoesisGUI.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- Anchor Chain chainloader (ACPlugin attribute + IAnchorChainMod).
+         Checked-in copy of AnchorChain.dll from the releases dev.zip.
+         NOTE: these two references are steam-branch only, so every merge from a
+         BepInEx-plugin branch is liable to drop them again - that is how they
+         went missing before. If AnchorChainEntry.cs stops compiling after a
+         merge, this block is the first place to look. -->
+    <Reference Include="AnchorChain">
+      <HintPath>..\lib\AnchorChain.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- AnchorChain is built against netstandard 2.1; reference the Unity facade
+         so net472 can consume it. -->
+    <Reference Include="netstandard">
+      <HintPath>$(GameDir)\Sea Power_Data\Managed\netstandard.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Standing Orders (TacticalDoctrine) and its settings derive from the toolkit's
+         ObservableObject, so touching them needs the reference. Shipped with the game. -->
+    <Reference Include="CommunityToolkit.Mvvm">
+      <HintPath>$(GameDir)\Sea Power_Data\Managed\CommunityToolkit.Mvvm.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
-  <!-- LiteNetLib — UDP networking -->
+  <!-- LiteNetLib — UDP networking. Merged into our DLL by ILRepack below. -->
   <ItemGroup>
     <PackageReference Include="LiteNetLib" Version="1.3.5" />
+    <PackageReference Include="ILRepack.Lib.MSBuild.Task" Version="2.0.34.2" PrivateAssets="all" />
   </ItemGroup>
 
 
 	<PropertyGroup>
-    <GameDir2>C:\Users\hughe\Desktop\Sea Power</GameDir2>
+    <GameDir2 Condition="'$(GameDir2)' == ''"></GameDir2>
+    <!-- Third and fourth local test instances (Run Coop.bat launches all four).
+         Conditioned on existing, unlike the two above: these are only present on a
+         machine set up for 4-player local testing. Missing them silently is right;
+         a stale DLL here is NOT silent - the protocol version is baked into the
+         LiteNetLib connect key, so an out-of-date instance is rejected at connect
+         and simply looks like the Connect button doing nothing. -->
+    <GameDir3 Condition="'$(GameDir3)' == ''"></GameDir3>
+    <GameDir4 Condition="'$(GameDir4)' == ''"></GameDir4>
   </PropertyGroup>
 
-  <Target Name="CopyToPlugins" AfterTargets="Build">
-    <!-- Copy our plugin DLL -->
-    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="$(GameDir)\BepInEx\plugins\" />
-    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="$(GameDir2)\BepInEx\plugins\" />
-    <!-- Copy NuGet dependency DLLs (e.g. LiteNetLib) that BepInEx needs at runtime -->
+  <!-- Merge LiteNetLib into our assembly.
+       Anchor Chain calls GetExportedTypes() on every candidate DLL *before* any
+       of our code runs, so an unresolved LiteNetLib reference throws
+       ReflectionTypeLoadException at discovery and the mod is skipped entirely.
+       No runtime resolver can help that (ours would not have been installed
+       yet), so the reference has to not exist: ILRepack folds LiteNetLib in. -->
+  <Target Name="ILRepackMerge" AfterTargets="Build">
     <ItemGroup>
-      <PluginDeps Include="$(OutputPath)*.dll" Exclude="$(OutputPath)$(AssemblyName).dll;$(OutputPath)System.*.dll;$(OutputPath)mscorlib.dll;$(OutputPath)netstandard.dll" />
+      <MergeInputs Include="$(OutputPath)$(AssemblyName).dll" />
+      <MergeInputs Include="$(OutputPath)LiteNetLib.dll" />
+      <MergeLibDirs Include="$(OutputPath)" />
+      <MergeLibDirs Include="..\lib" />
+      <MergeLibDirs Include="$(GameDir)\Sea Power_Data\Managed" />
+      <MergeLibDirs Include="$(GameDir)\BepInEx\core" />
     </ItemGroup>
-    <Copy SourceFiles="@(PluginDeps)" DestinationFolder="$(GameDir)\BepInEx\plugins\" />
-    <Copy SourceFiles="@(PluginDeps)" DestinationFolder="$(GameDir2)\BepInEx\plugins\" />
-    <Message Text="Copied plugin + dependencies to $(GameDir)\BepInEx\plugins\" Importance="high" />
-    <Message Text="Copied plugin + dependencies to $(GameDir2)\BepInEx\plugins\" Importance="high" />
+    <ILRepack
+      Parallel="true"
+      Internalize="true"
+      InputAssemblies="@(MergeInputs)"
+      LibraryPath="@(MergeLibDirs)"
+      TargetKind="Dll"
+      OutputFile="$(OutputPath)merged\$(AssemblyName).dll" />
+  </Target>
+
+  <!-- Anchor Chain loads mods from a folder under StreamingAssets (or a workshop
+       item dir). The merged DLL plus _info.ini (the game's own mod manifest, which
+       gates the "incompatible version" prompt) are the whole workshop item. The
+       build output path is deliberately NOT set to StreamingAssets, per the
+       Anchor Chain docs' warning about IDEs clobbering that folder. -->
+  <!-- Set SkipDeploy=true when testing the Steam Workshop copy: two installs of
+       the same GUID make Anchor Chain load both and keep whichever it happens to
+       see first, which may be the one you meant to disable. -->
+  <Target Name="CopyToStreamingAssets" AfterTargets="ILRepackMerge" Condition="'$(SkipDeploy)' != 'true'">
+    <PropertyGroup>
+      <ModDir>Sea Power_Data\StreamingAssets\SeapowerMultiplayer</ModDir>
+    </PropertyGroup>
+    <ItemGroup>
+      <ModFiles Include="$(OutputPath)merged\$(AssemblyName).dll" />
+      <ModFiles Include="..\workshop\_info.ini" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ModFiles)" DestinationFolder="$(GameDir)\$(ModDir)\" />
+    <Copy SourceFiles="@(ModFiles)" DestinationFolder="$(GameDir2)\$(ModDir)\"
+          Condition="'$(GameDir2)' != '' And Exists('$(GameDir2)')" />
+    <Message Text="Copied plugin to $(GameDir)\$(ModDir)\" Importance="high" />
+    <Message Text="Copied plugin to $(GameDir2)\$(ModDir)\" Importance="high"
+             Condition="'$(GameDir2)' != '' And Exists('$(GameDir2)')" />
+    <Copy SourceFiles="@(ModFiles)" DestinationFolder="$(GameDir3)\$(ModDir)\"
+          Condition="'$(GameDir3)' != '' And Exists('$(GameDir3)')" />
+    <Copy SourceFiles="@(ModFiles)" DestinationFolder="$(GameDir4)\$(ModDir)\"
+          Condition="'$(GameDir4)' != '' And Exists('$(GameDir4)')" />
+    <Message Text="Copied plugin to $(GameDir3)\$(ModDir)\"
+             Importance="high" Condition="'$(GameDir3)' != '' And Exists('$(GameDir3)')" />
+    <Message Text="Copied plugin to $(GameDir4)\$(ModDir)\"
+             Importance="high" Condition="'$(GameDir4)' != '' And Exists('$(GameDir4)')" />
+  </Target>
+
+  <!-- Stopgap while Anchor Chain does not load on the current game build: the same
+       DLL also carries a BepInEx entry (BepInExEntry), so a copy in BepInEx\plugins
+       runs without it. Plugin.Boot lets only one copy boot when both are present, but
+       the plugins copy starts first and ignores the mod menu checkbox - set this to
+       false (and delete those copies) once Anchor Chain works again. -->
+  <PropertyGroup>
+    <DeployToBepInExPlugins Condition="'$(DeployToBepInExPlugins)' == ''">true</DeployToBepInExPlugins>
+  </PropertyGroup>
+  <Target Name="CopyToBepInExPlugins" AfterTargets="ILRepackMerge"
+          Condition="'$(SkipDeploy)' != 'true' And '$(DeployToBepInExPlugins)' == 'true'">
+    <ItemGroup>
+      <PluginDll Include="$(OutputPath)merged\$(AssemblyName).dll" />
+      <PluginDirs Include="$(GameDir);$(GameDir2);$(GameDir3);$(GameDir4)" />
+    </ItemGroup>
+    <Copy SourceFiles="@(PluginDll)" DestinationFolder="%(PluginDirs.Identity)\BepInEx\plugins\"
+          Condition="Exists('%(PluginDirs.Identity)\BepInEx\plugins')" />
+    <Message Text="Copied plugin to %(PluginDirs.Identity)\BepInEx\plugins\" Importance="high"
+             Condition="Exists('%(PluginDirs.Identity)\BepInEx\plugins')" />
   </Target>
 
   <!-- Bundled scenarios. FileManager builds the mod search path from the folders
@@ -129,7 +222,8 @@
       <ModMissions Include="..\missions\**\*" Exclude="..\missions\**\*.meta" />
     </ItemGroup>
     <Copy SourceFiles="@(ModMissions)" DestinationFiles="@(ModMissions->'$(GameDir)\$(MissionsDir)\%(RecursiveDir)%(Filename)%(Extension)')" />
-    <Copy SourceFiles="@(ModMissions)" DestinationFiles="@(ModMissions->'$(GameDir2)\$(MissionsDir)\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Copy SourceFiles="@(ModMissions)" DestinationFiles="@(ModMissions->'$(GameDir2)\$(MissionsDir)\%(RecursiveDir)%(Filename)%(Extension)')"
+          Condition="'$(GameDir2)' != '' And Exists('$(GameDir2)')" />
     <Message Text="Copied @(ModMissions->Count()) mission file(s) to $(MissionsDir)\" Importance="high" />
   </Target>
 
