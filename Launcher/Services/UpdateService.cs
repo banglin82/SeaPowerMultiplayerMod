@@ -17,7 +17,7 @@ namespace SeapowerMultiplayer.Launcher.Services
 
     public static class UpdateService
     {
-        private const string RepoOwner = "malfboi";
+        private const string RepoOwner = "banglin82";
         private const string RepoName = "SeaPowerMultiplayerMod";
         private const string AssetName = "SeapowerMultiplayerLauncher.exe";
 
