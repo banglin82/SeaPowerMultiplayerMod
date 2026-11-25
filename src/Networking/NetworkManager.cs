@@ -661,7 +661,12 @@ namespace SeapowerMultiplayer
                 }
                 else
                 {
-                    var requested = SteamLobbyManager.PendingTeamForJoin ?? Team.Host;
+                    // Steam joins carry the side from the lobby's invite (falling back to
+                    // DefaultTeam there); a direct-IP join has no lobby, so DefaultTeam is
+                    // its only way to ask for a side.
+                    var requested = Plugin.Instance.CfgTransport.Value == "Steam"
+                        ? SteamLobbyManager.PendingTeamForJoin ?? Team.Host
+                        : Teams.Parse(Plugin.Instance.CfgDefaultTeam.Value);
                     PlayerRegistry.GuestInit(LocalPersonaName(), requested);
 
                     var hello = new HelloMessage

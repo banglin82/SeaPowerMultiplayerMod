@@ -103,14 +103,14 @@ If you prefer to manage things yourself:
 2. Press **Ctrl+F9** to open the multiplayer overlay (top-right corner).
 3. **Host:** Open a mission, then click **Start Hosting**. Default port is `7777`.
 4. **Client:** Enter the host's IP address, then click **Connect**.
-5. Players joining without an invite request the side in their `DefaultTeam` config setting. Before a player has loaded, the host can move them using the side buttons on their roster row.
-6. Once connected, the host can send the scene to all players or to an individual player to sync the scenario.
+5. Each client asks for the side in its `DefaultTeam` config setting. Before a player has loaded, the host can move them using the side buttons on their roster row.
+6. Once connected, the host clicks **Send** on each player's roster row to sync the scenario to them.
 
 Each client automatically receives and loads the host's save - no need to manually load the same mission.
 
 ### Teams and units
 
-The host is always on the mission's player side. Teammates share their contact picture and map drawings; opponents don't. With **Lock units to players** on, each player owns the formations assigned to them, and formations can be handed to a teammate from the right-click **send to player** menu.
+The host is always on the mission's player side. Teammates share their contact picture and map drawings; opponents don't. With **Lock units to players** on, each player owns the formations assigned to them, and formations can be handed to a teammate with **Send formation to player** in the right-click menu.
 
 The **Name** (`Username`) setting is what other players see in the roster.
 
@@ -141,7 +141,7 @@ Press **Ctrl+F9** in-game and open the **Settings** section of the overlay. Chan
 | `Auto-connect` | off | Automatically host/connect on game launch |
 | `Time vote` | off | Players must agree on time compression changes |
 
-`DefaultTeam` (Blue) and `PvP` (off - seat un-invited joiners on the opposite side) are config-file settings in the `[Network]` section.
+Two more settings live only in the config file, under `[Network]`: `DefaultTeam` (Blue) is the side a client asks for when it connects by IP, and `PvP` (off) makes a Steam lobby seat players who join without a side-specific invite on the side opposite the host.
 
 Network settings are locked while a session is running - disconnect to change them. The **Advanced** subsection holds state-stream rates and debug options, which apply live.
 
