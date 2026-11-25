@@ -15,11 +15,11 @@
 
 <br>
 
-Play any Sea Power scenario head-to-head with a friend. One player hosts, the other connects, and you're in. Both instances run their own units authoritatively, with game state synced over UDP or Steam P2P.
+Play any Sea Power scenario with up to 8 players, in any mix of co-op and versus - 2v2, 2v1, or everyone on one side. One player hosts, and the host's game runs the authoritative simulation for every unit. Other players' orders go to the host, with game state synced over UDP or Steam P2P.
 
 ### How combat works
 
-Combat is resolved by the **target** of the engagement. If Player A fires a missile at Player B, then Player B's game decides the outcome. If B's air defence intercepts it, that result syncs to A. If the missile hits, both sides see the hit. When the two instances disagree, the target's outcome is always final.
+The host's game decides every engagement outcome - hits, intercepts, damage and destruction - and streams the result to all players. Guests' local simulations are not allowed to destroy or spawn things on their own.
 
 > This is a community mod and is not affiliated with Triassic Games.
 
@@ -94,8 +94,8 @@ If you prefer to manage things yourself:
 2. Open a mission.
 3. Press **Ctrl+F9** to open the multiplayer overlay.
 4. Click **Host Lobby**.
-5. Click **Invite Friend** and send a Steam invite.
-6. Your friend accepts and is automatically connected and synced into the mission.
+5. Click **Invite player to \<side\>** for the side your friend should join and send a Steam invite. There is one button per side in the mission.
+6. Your friend accepts and is automatically connected and synced into the mission. Repeat to invite more players.
 
 ### Via Direct Connect
 
@@ -103,25 +103,32 @@ If you prefer to manage things yourself:
 2. Press **Ctrl+F9** to open the multiplayer overlay (top-right corner).
 3. **Host:** Open a mission, then click **Start Hosting**. Default port is `7777`.
 4. **Client:** Enter the host's IP address, then click **Connect**.
-5. Once connected, the host clicks **Send Scene to Client** to sync the scenario.
+5. Players joining without an invite request the side in their `DefaultTeam` config setting. Before a player has loaded, the host can move them using the side buttons on their roster row.
+6. Once connected, the host can send the scene to all players or to an individual player to sync the scenario.
 
-The client automatically receives and loads the host's save - no need to manually load the same mission.
+Each client automatically receives and loads the host's save - no need to manually load the same mission.
+
+### Teams and units
+
+The host is always on the mission's player side. Teammates share their contact picture and map drawings; opponents don't. With **Lock units to players** on, each player owns the formations assigned to them, and formations can be handed to a teammate from the right-click **send to player** menu.
+
+The **Name** (`Username`) setting is what other players see in the roster.
 
 ### In-Game Controls
 
-Both players use the normal game controls. In PvP, both sides are authoritative for their own units. In co-op, the host's game is authoritative and client orders are sent to the host for execution.
+All players use the normal game controls. The host's game is authoritative for every unit, and guest orders are sent to the host for execution.
 
 | Action | Shortcut | Notes |
 |--------|----------|-------|
 | Open multiplayer overlay | `Ctrl+F9` | Host, connect, invite, send scene |
-| Force resync | `Ctrl+F10` | Either player can trigger this |
+| Force resync | `Ctrl+F10` | Any player can trigger this |
 | Time controls | Normal keys | Synced - host decides and broadcasts the result |
 
 <br>
 
 ## Configuration
 
-Press **Ctrl+F9** in-game and open the **Settings** section of the overlay. Changes are saved immediately - there is no file to edit and no restart needed.
+Press **Ctrl+F9** in-game and open the **Settings** section of the overlay. Changes are saved immediately - no restart needed.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -129,9 +136,12 @@ Press **Ctrl+F9** in-game and open the **Settings** section of the overlay. Chan
 | `Transport` | `Direct IP` | Network transport - `Direct IP` (LiteNetLib) or `Steam` |
 | `Host IP` | `127.0.0.1` | IP to connect to (client only) |
 | `Port` | `7777` | UDP port (must match on both sides) |
-| `Mode` | `PvP` | PvP (opposing taskforces) or Co-op (shared control) |
+| `Name` | empty | Name shown to other players |
+| `Lock units to players` | on | Host setting: assign formations to individual players |
 | `Auto-connect` | off | Automatically host/connect on game launch |
-| `Time vote` | off | Both players must agree on time compression changes |
+| `Time vote` | off | Players must agree on time compression changes |
+
+`DefaultTeam` (Blue) and `PvP` (off - seat un-invited joiners on the opposite side) are config-file settings in the `[Network]` section.
 
 Network settings are locked while a session is running - disconnect to change them. The **Advanced** subsection holds state-stream rates and debug options, which apply live.
 
@@ -141,14 +151,14 @@ Settings are still persisted to `BepInEx/config/com.seapowermultiplayer.plugin.c
 
 | Transport | Port Forwarding | Details |
 |-----------|:-:|---------|
-| **LiteNetLib (UDP)** | Required | Host must open port `7777` (or configured port) for UDP. Both players need a direct network path (LAN, port forwarding, or VPN). |
+| **LiteNetLib (UDP)** | Required | Host must open port `7777` (or configured port) for UDP. Each player needs a direct network path to the host (LAN, port forwarding, or VPN). |
 | **Steam P2P** | Not required | Uses Steam's relay network. Just works. |
 
 <br>
 
 **Key concepts:**
 
-- **Authority model** - Each player is authoritative over their own units. Combat outcomes are decided by the target's game instance.
+- **Authority model** - The host simulates every unit and decides combat outcomes; guests send orders to the host.
 - **Transport abstraction** - Networking is abstracted behind `ITransport`, making it easy to swap between LiteNetLib (UDP) and Steam P2P.
 - **Harmony patching** - The mod hooks into the game via [Harmony](https://github.com/pardeike/Harmony) patches, intercepting and extending game methods at runtime.
 - **State reconciliation** - Host broadcasts authoritative unit state; clients apply snap/lerp corrections in `StateApplier` to keep puppet units aligned.
@@ -173,7 +183,7 @@ Contributions are welcome! Whether it's a bug fix, new feature, or documentation
 
 - **Keep PRs small and focused.** One feature or one fix per PR. Large, sweeping changesets are hard to review and slow down the merge process. If your work touches multiple areas, split it into separate PRs.
 - **Follow existing code style** and naming conventions.
-- **Test in a live multiplayer session** before submitting. At minimum, verify your change works in a two-player session (host + client). Pay special attention to combat sync - missiles, air defence, carrier ops, and ground attacks are all areas where subtle issues can hide.
+- **Test in a live multiplayer session** before submitting. At minimum, verify your change works in a two-player session (host + client), and also test with 3+ players when touching networking or teams. Pay special attention to combat sync - missiles, air defence, carrier ops, and ground attacks are all areas where subtle issues can hide.
 - **Open an issue first for large features** so we can discuss the approach before you invest time building it.
 - **Document what you changed** in your PR description. Explain *what* and *why*, not just *how*.
 
@@ -238,7 +248,7 @@ Verify the host's IP and port are correct, and that the UDP port is open in the 
 <details>
 <summary><b>Desync or drift</b></summary>
 
-The mod includes automatic drift detection and correction. If issues persist, either player can press **Ctrl+F10** to force a resync, or the host can re-send the scene via the Ctrl+F9 overlay.
+The mod includes automatic drift detection and correction. If issues persist, any player can press **Ctrl+F10** to force a resync, or the host can re-send the scene via the Ctrl+F9 overlay.
 
 </details>
 
@@ -263,7 +273,7 @@ The mod includes automatic drift detection and correction. If issues persist, ei
 - [x] Core PvP multiplayer
 - [ ] PvP beta bug fixes
 - [x] Co-op mode
-- [ ] Support for more than 2 players
+- [x] Support for more than 2 players
 - [ ] Headless persistent server
 
 Have ideas? [Open a discussion](../../discussions) or share them in the [Discord](https://discord.gg/rMMnwJHc8w).

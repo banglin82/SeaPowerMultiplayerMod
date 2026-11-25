@@ -930,11 +930,9 @@ namespace SeapowerMultiplayer
                         // to the client as part of the normal shared picture.
                         var contact = StateSerializer.FindById(msg.TargetEntityId);
                         if (contact == null || contact.IsDestroyed) break;
-                        // Only meaningful when we have a teammate whose shared picture
-                        // this reveal feeds. (Team-scoped rather than sender-scoped for
-                        // now - tightening it to the requesting slot needs the ambient
-                        // sender identity, which the order relay work introduces.)
-                        if (!Teams.HasTeammates) break;
+                        // Only meaningful when the asking unit's team shares a picture.
+                        var askTeam = Teams.TeamOf(unit);
+                        if (askTeam == null || !ContactSyncManager.TeamShares(askTeam.Value)) break;
 
                         // Re-check against OUR roll, which is the authoritative one.
                         // A client running a stale value cannot talk a merchant into

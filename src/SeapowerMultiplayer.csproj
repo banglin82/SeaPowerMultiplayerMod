@@ -109,15 +109,15 @@
 
 
 	<PropertyGroup>
-    <GameDir2>C:\Users\hughe\Desktop\Sea Power</GameDir2>
+    <GameDir2 Condition="'$(GameDir2)' == ''"></GameDir2>
     <!-- Third and fourth local test instances (Run Coop.bat launches all four).
          Conditioned on existing, unlike the two above: these are only present on a
          machine set up for 4-player local testing. Missing them silently is right;
          a stale DLL here is NOT silent - the protocol version is baked into the
          LiteNetLib connect key, so an out-of-date instance is rejected at connect
          and simply looks like the Connect button doing nothing. -->
-    <GameDir3>C:\Users\hughe\Desktop\Sea Power Player 3</GameDir3>
-    <GameDir4>C:\Users\hughe\Desktop\Sea Power Player 4</GameDir4>
+    <GameDir3 Condition="'$(GameDir3)' == ''"></GameDir3>
+    <GameDir4 Condition="'$(GameDir4)' == ''"></GameDir4>
   </PropertyGroup>
 
   <!-- Merge LiteNetLib into our assembly.
@@ -161,17 +161,19 @@
       <ModFiles Include="..\workshop\_info.ini" />
     </ItemGroup>
     <Copy SourceFiles="@(ModFiles)" DestinationFolder="$(GameDir)\$(ModDir)\" />
-    <Copy SourceFiles="@(ModFiles)" DestinationFolder="$(GameDir2)\$(ModDir)\" />
+    <Copy SourceFiles="@(ModFiles)" DestinationFolder="$(GameDir2)\$(ModDir)\"
+          Condition="'$(GameDir2)' != '' And Exists('$(GameDir2)')" />
     <Message Text="Copied plugin to $(GameDir)\$(ModDir)\" Importance="high" />
-    <Message Text="Copied plugin to $(GameDir2)\$(ModDir)\" Importance="high" />
+    <Message Text="Copied plugin to $(GameDir2)\$(ModDir)\" Importance="high"
+             Condition="'$(GameDir2)' != '' And Exists('$(GameDir2)')" />
     <Copy SourceFiles="@(ModFiles)" DestinationFolder="$(GameDir3)\$(ModDir)\"
-          Condition="Exists('$(GameDir3)')" />
+          Condition="'$(GameDir3)' != '' And Exists('$(GameDir3)')" />
     <Copy SourceFiles="@(ModFiles)" DestinationFolder="$(GameDir4)\$(ModDir)\"
-          Condition="Exists('$(GameDir4)')" />
+          Condition="'$(GameDir4)' != '' And Exists('$(GameDir4)')" />
     <Message Text="Copied plugin to $(GameDir3)\$(ModDir)\"
-             Importance="high" Condition="Exists('$(GameDir3)')" />
+             Importance="high" Condition="'$(GameDir3)' != '' And Exists('$(GameDir3)')" />
     <Message Text="Copied plugin to $(GameDir4)\$(ModDir)\"
-             Importance="high" Condition="Exists('$(GameDir4)')" />
+             Importance="high" Condition="'$(GameDir4)' != '' And Exists('$(GameDir4)')" />
   </Target>
 
   <!-- Stopgap while Anchor Chain does not load on the current game build: the same
@@ -220,7 +222,8 @@
       <ModMissions Include="..\missions\**\*" Exclude="..\missions\**\*.meta" />
     </ItemGroup>
     <Copy SourceFiles="@(ModMissions)" DestinationFiles="@(ModMissions->'$(GameDir)\$(MissionsDir)\%(RecursiveDir)%(Filename)%(Extension)')" />
-    <Copy SourceFiles="@(ModMissions)" DestinationFiles="@(ModMissions->'$(GameDir2)\$(MissionsDir)\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Copy SourceFiles="@(ModMissions)" DestinationFiles="@(ModMissions->'$(GameDir2)\$(MissionsDir)\%(RecursiveDir)%(Filename)%(Extension)')"
+          Condition="'$(GameDir2)' != '' And Exists('$(GameDir2)')" />
     <Message Text="Copied @(ModMissions->Count()) mission file(s) to $(MissionsDir)\" Importance="high" />
   </Target>
 

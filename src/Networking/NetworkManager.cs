@@ -790,6 +790,7 @@ namespace SeapowerMultiplayer
 
             SimSyncManager.OnPeerLeft(slot);
             HostEntityStreamer.ClearViewportHint(slot);
+            ContactRevealManager.ForgetSlot(slot);
 
             // Their formations go to the longest-present remaining teammate, so nothing
             // on that side is left commandable by nobody. Before HostRemove, which is
@@ -1034,7 +1035,8 @@ namespace SeapowerMultiplayer
                 case MessageType.ContactReport:
                 {
                     var msg = ContactReportMessage.Deserialize(reader);
-                    _mainThreadQueue.Enqueue(() => ContactRevealManager.ApplyReceived(msg));
+                    byte slot = SlotOf(from);
+                    _mainThreadQueue.Enqueue(() => ContactRevealManager.ApplyReceived(slot, msg));
                     break;
                 }
 
